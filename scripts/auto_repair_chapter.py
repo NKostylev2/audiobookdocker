@@ -22,7 +22,7 @@ import whisper
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("AutoRepair")
 
-ROOT_DIR = Path(os.environ.get("AUDIOBOOK_ROOT_DIR", "/mnt/ai/AI-Dubbing"))
+ROOT_DIR = Path(os.environ.get("AUDIOBOOK_ROOT_DIR", "/mnt/ai/AI-Dubbing" if Path("/mnt/ai/AI-Dubbing").exists() else Path(__file__).resolve().parent.parent))
 COSY_DIR = ROOT_DIR / "CosyVoice"
 MATCHA_DIR = COSY_DIR / "third_party" / "Matcha-TTS"
 

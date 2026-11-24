@@ -46,8 +46,39 @@ C_WHITE = "\033[37m"
 def c_text(text: str, color: str) -> str:
     return f"{color}{text}{C_RESET}"
 
-ROOT_DIR = Path("/mnt/ai/AI-Dubbing")
-PYTHON_BIN = Path("/home/nk/.venvs/cosyvoice-env/bin/python")
+def find_root_dir() -> Path:
+    override = os.environ.get("AUDIOBOOK_ROOT_DIR")
+    if override and Path(override).is_dir():
+        return Path(override).resolve()
+    candidates = [
+        Path(__file__).resolve().parent,
+        Path("/mnt/ai/AI-Dubbing"),
+        Path.cwd(),
+    ]
+    for c in candidates:
+        if (c / "CosyVoice").is_dir() and (c / "voices").is_dir():
+            return c.resolve()
+    for c in candidates:
+        if (c / "scripts").is_dir() and (c / "output").is_dir():
+            return c.resolve()
+    return Path(__file__).resolve().parent
+
+ROOT_DIR = find_root_dir()
+
+def find_python_bin() -> Path:
+    override = os.environ.get("AUDIOBOOK_PYTHON_BIN")
+    if override and Path(override).is_file():
+        return Path(override).resolve()
+    candidates = [
+        Path("/home/nk/.venvs/cosyvoice-env/bin/python"),
+        Path(sys.executable),
+    ]
+    for c in candidates:
+        if c.is_file():
+            return c.resolve()
+    return Path(sys.executable)
+
+PYTHON_BIN = find_python_bin()
 CHAPTERS_DIR = ROOT_DIR / "output" / "Potter" / "chapters_ru"
 OUTPUT_DIR = ROOT_DIR / "output"
 SCRIPTS_DIR = ROOT_DIR / "scripts"

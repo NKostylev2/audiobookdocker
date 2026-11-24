@@ -1,0 +1,39 @@
+version: "3.8"
+
+services:
+  audiobook:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: nkostylev/ai-dubbing:latest
+    container_name: ai-dubbing-audiobook
+    restart: unless-stopped
+    ipc: host
+    stdin_open: true
+    tty: true
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+      - AUDIOBOOK_ROOT_DIR=/app
+      - PYTHONUNBUFFERED=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      # Host bind mounts for persistence
+      - ./output:/app/output
+      - ./work:/app/work
+      - ./voices:/app/voices:ro
+      # Model caches (so models are downloaded once and preserved across container restarts)
+      - cosyvoice_models:/app/CosyVoice/pretrained_models
+      - whisper_cache:/root/.cache/whisper
+
+volumes:
+  cosyvoice_models:
+    name: ai_dubbing_cosyvoice_models
+  whisper_cache:
+    name: ai_dubbing_whisper_cache

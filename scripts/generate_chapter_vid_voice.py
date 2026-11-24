@@ -119,26 +119,28 @@ def load_paragraphs(file_path: str) -> list:
         return paras
 
 def get_telegram_config():
-    token = None
-    proxy = None
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    proxy = os.environ.get("TELEGRAM_PROXY")
     env_candidates = [
+        ROOT_DIR / ".env",
         Path(r"/home/nk/dev/Telegram Remote Control/.env"),
         Path(r"M:\dev\Telegram Remote Control\.env"),
-        ROOT_DIR / ".env",
     ]
-    for env_file in env_candidates:
-        if env_file.exists():
-            with open(env_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith("TELEGRAM_BOT_TOKEN="):
-                        token = line.split("=", 1)[1].strip("\"'")
-                    elif line.startswith("TELEGRAM_PROXY="):
-                        proxy = line.split("=", 1)[1].strip("\"'")
-            if token:
-                break
+    if not token:
+        for env_file in env_candidates:
+            if env_file.exists():
+                with open(env_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("TELEGRAM_BOT_TOKEN="):
+                            token = line.split("=", 1)[1].strip("\"'")
+                        elif line.startswith("TELEGRAM_PROXY=") and not proxy:
+                            proxy = line.split("=", 1)[1].strip("\"'")
+                if token:
+                    break
 
-    chat_id = 373648438
+    chat_id_env = os.environ.get("TELEGRAM_CHAT_ID")
+    chat_id = int(chat_id_env) if chat_id_env and chat_id_env.isdigit() else 373648438
     db_candidates = [
         Path(r"/home/nk/dev/Telegram Remote Control/data/tasks.sqlite3"),
         Path(r"M:\dev\Telegram Remote Control/data/tasks.sqlite3"),

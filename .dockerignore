@@ -1,0 +1,55 @@
+# Git & IDE
+.git
+.gitignore
+.gitattributes
+.idea
+.vscode
+.agent
+
+# Virtual environments & Caches
+.venv
+cosyvoice_env
+chatterbox_env
+env
+__pycache__
+*.py[cod]
+*.pytest_cache
+*.ruff_cache
+
+# Large media outputs and work folders
+output/
+work/
+cache/
+logs/
+database/
+*.mp4
+*.mkv
+*.wav
+*.mp3
+*.flac
+*.zip
+*.tar
+*.tar.gz
+
+# Pretrained model weights (downloaded on container startup or mounted via volume)
+models/
+CosyVoice/pretrained_models/
+*.pt
+*.pth
+*.onnx
+*.ckpt
+*.safetensors
+*.bin
+
+# Local vendor binaries
+vendor/
+system/
+*.exe
+*.dll
+
+# Secrets & temporary files
+.env
+.env.*
+*.token
+*.tmp
+*.log
