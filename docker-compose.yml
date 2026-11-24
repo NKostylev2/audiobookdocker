@@ -2,6 +2,7 @@ services:
   audiobook:
     image: nkostylev/ai-dubbing:latest
     container_name: ai-dubbing-audiobook
+    entrypoint: ["/bin/bash", "/usr/local/bin/entrypoint.sh"]
     restart: unless-stopped
     ipc: host
     stdin_open: true
