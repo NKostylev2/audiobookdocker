@@ -23,6 +23,8 @@ onnx==1.16.0
 onnxruntime-gpu==1.18.0
 pyworld==0.3.4
 gdown==5.1.0
+pyarrow==18.1.0
+tensorboard
 matplotlib
 networkx
 conformer==0.3.2

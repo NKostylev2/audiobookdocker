@@ -14,10 +14,10 @@ export PYTHONPATH="/app:/app/CosyVoice:/app/CosyVoice/third_party/Matcha-TTS:${P
 export AUDIOBOOK_ROOT_DIR="/app"
 export PYTHONUNBUFFERED=1
 
-# Ensure gdown and auxiliary dependencies are present
-if ! python3 -c "import gdown" 2>/dev/null; then
-    echo "[INFO] Installing runtime dependencies: gdown matplotlib networkx..."
-    pip install --no-cache-dir gdown matplotlib networkx
+# Ensure gdown, pyarrow and auxiliary dependencies are present
+if ! python3 -c "import gdown, pyarrow" 2>/dev/null; then
+    echo "[INFO] Installing runtime dependencies: pyarrow gdown matplotlib networkx tensorboard..."
+    pip install --no-cache-dir pyarrow gdown matplotlib networkx tensorboard
 fi
 
 # Check if CosyVoice submodule or directory is missing
