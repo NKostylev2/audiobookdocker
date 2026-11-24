@@ -67,3 +67,4 @@ data/*.db
 # Upstream third party repos
 CosyVoice/
 alltalk_tts/
+audiobook_pipeline_code.zip

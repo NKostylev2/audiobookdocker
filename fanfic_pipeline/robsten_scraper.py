@@ -58,13 +58,25 @@ def get_toc(force_refresh: bool = False) -> List[Dict[str, Any]]:
             if getattr(curr, "name", None) in ["b", "strong"] and re.match(r"^(?:Глава|ЭПИЛОГ|Ауттейк)", curr.get_text(strip=True), re.I):
                 break
 
+            # Check for links nested inside tags (e.g. <span>...<a href="...">...</a></span>)
+            if hasattr(curr, "find_all"):
+                for a in curr.find_all("a"):
+                    if a.has_attr("href") and ("publ" in a["href"] or "wide_awake" in a["href"]):
+                        links.append({
+                            "part_name": a.get_text(strip=True),
+                            "url": a["href"]
+                        })
+                        a.decompose()  # remove so its text does not pollute the title
+
             if getattr(curr, "name", None) == "a" and curr.has_attr("href") and ("publ" in curr["href"] or "wide_awake" in curr["href"]):
                 links.append({
                     "part_name": curr.get_text(strip=True),
                     "url": curr["href"]
                 })
             elif getattr(curr, "name", None) == "span":
-                title_parts.append(curr.get_text(strip=True))
+                st = curr.get_text(strip=True)
+                if st:
+                    title_parts.append(st)
             elif isinstance(curr, str):
                 st = curr.strip(" \t\n\r-.")
                 if st and not st.isdigit() and len(st) > 1:
@@ -76,18 +88,19 @@ def get_toc(force_refresh: bool = False) -> List[Dict[str, Any]]:
         title = re.sub(r"\s+", " ", title)
 
         # Extract chapter number(s)
-        m = re.search(r"(\d+)(?:\s*[-–—]\s*(\d+))?", b_text)
-        if m:
-            start_num = int(m.group(1))
-            end_num = int(m.group(2)) if m.group(2) else start_num
-        elif "ЭПИЛОГ" in b_text.upper():
-            start_num, end_num = 999, 999
-        elif "Ауттейк" in b_text:
+        if "Ауттейк" in b_text:
             m_a = re.search(r"(\d+)", b_text)
             start_num = 1000 + (int(m_a.group(1)) if m_a else 1)
             end_num = start_num
+        elif "ЭПИЛОГ" in b_text.upper():
+            start_num, end_num = 999, 999
         else:
-            start_num, end_num = 0, 0
+            m = re.search(r"(\d+)(?:\s*[-–—]\s*(\d+))?", b_text)
+            if m:
+                start_num = int(m.group(1))
+                end_num = int(m.group(2)) if m.group(2) else start_num
+            else:
+                start_num, end_num = 0, 0
 
         chapters.append({
             "header": b_text,
@@ -150,12 +163,15 @@ def clean_and_split_sections(html_snippets: List[str], default_pov: str = "bella
 
         # Normalize POV marker tags
         for tag in soup.find_all(["b", "strong", "p", "div", "span"]):
-            # Only consider short tags
-            t = tag.get_text(strip=True).upper()
-            if t in ["БЕЛЛА", "BELLA", "БЕЛЛА POV", "БЕЛЛА POV."]:
+            clean_t = re.sub(r"[\s\.\:\-\—]+$", "", tag.get_text(strip=True).upper())
+            if clean_t in ["БЕЛЛА", "BELLA", "БЕЛЛА POV", "BELLA POV"]:
                 tag.replace_with("\n===POV:BELLA===\n")
-            elif t in ["ЭДВАРД", "EDWARD", "ЭДВАРД POV", "ЭДВАРД POV."]:
+            elif clean_t in ["ЭДВАРД", "EDWARD", "ЭДВАРД POV", "EDWARD POV"]:
                 tag.replace_with("\n===POV:EDWARD===\n")
+            elif clean_t in ["КАРЛАЙЛ", "CARLISLE", "КАРЛАЙЛ POV", "CARLISLE POV", "CPOV"]:
+                tag.replace_with("\n===POV:CARLISLE===\n")
+            elif clean_t in ["ЭЛИЗАБЕТ", "ELIZABETH", "ЭЛИЗАБЕТ МЕЙСЕН", "ELIZABETH MASEN", "ЭЛИЗАБЕТ POV"]:
+                tag.replace_with("\n===POV:ELIZABETH===\n")
 
         text = soup.get_text()
 
@@ -200,6 +216,20 @@ def clean_and_split_sections(html_snippets: List[str], default_pov: str = "bella
                         sections.append({"pov": current_pov, "text": sec_text})
                     current_paragraphs = []
                 current_pov = "edward"
+            elif line == "===POV:CARLISLE===":
+                if current_paragraphs:
+                    sec_text = "\n\n".join(current_paragraphs).strip()
+                    if sec_text:
+                        sections.append({"pov": current_pov, "text": sec_text})
+                    current_paragraphs = []
+                current_pov = "carlisle"
+            elif line == "===POV:ELIZABETH===":
+                if current_paragraphs:
+                    sec_text = "\n\n".join(current_paragraphs).strip()
+                    if sec_text:
+                        sections.append({"pov": current_pov, "text": sec_text})
+                    current_paragraphs = []
+                current_pov = "elizabeth"
             else:
                 # Normal paragraph text
                 current_paragraphs.append(line)
@@ -245,8 +275,16 @@ def get_chapter_sections(chapter_num: int, force_refresh: bool = False, apply_ce
         html = fetch_page_text(link["url"], force_refresh=force_refresh)
         html_snippets.append(html)
 
-    # By default, chapters start with Bella unless specified otherwise (like Chapter 18 which is Edward POV)
-    default_pov = "edward" if "Эдвард POV" in target_entry["title"] or "Эдвард POV" in target_entry["header"] else "bella"
+    # Determine default initial POV
+    title_header = f"{target_entry.get('header', '')} {target_entry.get('title', '')}"
+    if any(k in title_header for k in ["Эдвард POV", "от лица Эдварда"]):
+        default_pov = "edward"
+    elif any(k in title_header for k in ["Карлайл", "от лица Карлайла"]):
+        default_pov = "carlisle"
+    elif any(k in title_header for k in ["Элизабет", "от лица Элизабет"]):
+        default_pov = "elizabeth"
+    else:
+        default_pov = "bella"
     sections = clean_and_split_sections(html_snippets, default_pov=default_pov)
 
     for sec in sections:

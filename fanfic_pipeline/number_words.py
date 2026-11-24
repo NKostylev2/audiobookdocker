@@ -58,10 +58,35 @@ ORDINALS_FEMININE = {
     52: "пятьдесят вторая",
 }
 
+ORDINALS_MASCULINE = {
+    1: "первый",
+    2: "второй",
+    3: "третий",
+    4: "четвёртый",
+    5: "пятый",
+    6: "шестой",
+    7: "седьмой",
+    8: "восьмой",
+    9: "девятый",
+    10: "десятый",
+}
+
+CHARACTER_NAMES = {
+    "bella": "Белла",
+    "edward": "Эдвард",
+    "carlisle": "Карлайл",
+    "elizabeth": "Элизабет",
+}
+
 
 def get_ordinal_f(n: int) -> str:
     """Return Russian feminine ordinal for number n (1 -> первая)."""
     return ORDINALS_FEMININE.get(n, str(n))
+
+
+def get_ordinal_m(n: int) -> str:
+    """Return Russian masculine ordinal for number n (1 -> первый)."""
+    return ORDINALS_MASCULINE.get(n, str(n))
 
 
 def get_section_announcement(
@@ -79,11 +104,18 @@ def get_section_announcement(
     - At subsequent sections (sec_idx > 0):
         'Часть вторая. Эдвард.'
     """
-    char_name = "Белла" if pov.lower() == "bella" else "Эдвард"
+    char_name = CHARACTER_NAMES.get(pov.lower(), pov.capitalize())
     part_word = get_ordinal_f(sec_idx + 1)
 
     if sec_idx == 0:
-        if chapter_num >= 999:
+        if chapter_num >= 1000:
+            outtake_num = chapter_num - 1000
+            o_word = get_ordinal_m(outtake_num)
+            if chapter_title:
+                clean_title = chapter_title.strip(" .")
+                return f"Ауттейк {o_word}. {clean_title}. {char_name}."
+            return f"Ауттейк {o_word}. {char_name}."
+        elif chapter_num == 999:
             ch_word = "Эпилог"
             if chapter_title:
                 clean_title = chapter_title.strip(" .")

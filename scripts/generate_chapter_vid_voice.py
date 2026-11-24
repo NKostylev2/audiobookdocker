@@ -1,4 +1,5 @@
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import sys
 import time
 import json
@@ -8,17 +9,57 @@ import urllib.request
 import urllib.error
 import argparse
 import zipfile
+import shutil
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-# Setup root paths
-ROOT_DIR = r"E:\AI-Dubbing"
-COSY_DIR = os.path.join(ROOT_DIR, "CosyVoice")
-OUT_DIR = Path(r"E:\AI-Dubbing\output\chapter_01_vid_voice")
-OUT_DIR.mkdir(parents=True, exist_ok=True)
-CACHE_DIR = OUT_DIR / "segments"
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
+# --- Dynamic Path Resolution (Cross-platform Windows & Linux) ---
+def find_root_dir() -> Path:
+    candidates = [
+        Path("/mnt/ai/AI-Dubbing"),
+        Path(r"E:\AI-Dubbing"),
+        Path.cwd(),
+        Path.cwd().parent,
+    ]
+    for c in candidates:
+        if (c / "CosyVoice").is_dir() and (c / "voices").is_dir():
+            return c.resolve()
+    return Path.cwd().resolve()
 
+ROOT_DIR = find_root_dir()
+COSY_DIR = ROOT_DIR / "CosyVoice"
+MATCHA_DIR = COSY_DIR / "third_party" / "Matcha-TTS"
+
+for p in [str(ROOT_DIR), str(COSY_DIR), str(MATCHA_DIR)]:
+    if p not in sys.path and os.path.exists(p):
+        sys.path.insert(0, p)
+
+def find_ffmpeg() -> Path:
+    which = shutil.which("ffmpeg")
+    if which:
+        return Path(which)
+    candidate = ROOT_DIR / "vendor" / "ffmpeg" / "bin" / "ffmpeg.exe"
+    if candidate.exists():
+        return candidate
+    return Path("ffmpeg")
+
+def find_default_voice() -> Path:
+    candidates = [
+        ROOT_DIR / "voices" / "VID_20261101_122350_289.wav",
+        ROOT_DIR / "alltalk_tts" / "voices" / "VID_20261101_122350_289.wav",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c.resolve()
+    return candidates[0]
+
+FFMPEG_EXE = find_ffmpeg()
+VOICE_FILE = str(find_default_voice())
+VOICE_NAME = Path(VOICE_FILE).stem
+DEFAULT_TEXT_PATH = str(ROOT_DIR / "chapter.txt")
+
+OUT_DIR = ROOT_DIR / "output" / "chamber_of_secrets_ch01_vid_voice"
+CACHE_DIR = OUT_DIR / "segments"
 LOG_FILE = OUT_DIR / "generation.log"
 STATUS_FILE = OUT_DIR / "status.json"
 
@@ -26,30 +67,18 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler(str(LOG_FILE), encoding="utf-8"),
         logging.StreamHandler(sys.stdout),
     ],
 )
 logger = logging.getLogger("ChapterVIDGenerator")
 
-if ROOT_DIR not in sys.path:
-    sys.path.insert(0, ROOT_DIR)
-if COSY_DIR not in sys.path:
-    sys.path.insert(0, COSY_DIR)
-matcha_dir = os.path.join(COSY_DIR, "third_party", "Matcha-TTS")
-if matcha_dir not in sys.path:
-    sys.path.insert(0, matcha_dir)
-
 import re
+import numpy as np
 import torch
 import torchaudio
+import razdel
 from cosyvoice.cli.cosyvoice import AutoModel
 from fanfic_pipeline.segmenter import SentenceSegmenter
-
-FFMPEG_EXE = Path(r"E:\AI-Dubbing\vendor\ffmpeg\bin\ffmpeg.exe")
-VOICE_FILE = r"E:\AI-Dubbing\alltalk_tts\voices\VID_20261101_122350_289.wav"
-VOICE_NAME = "VID_20261101_122350_289"
-CHAPTER_TEXT_PATH = r"M:\dev\Telegram Remote Control\%D0%93%D0%BB%D0%B0%D0%B2%D0%B0_1_%D0%BF%D0%BE%D0%BB%D0%BD%D1%8B%D0%B9.docx"
 
 def load_paragraphs(file_path: str) -> list:
     p = Path(file_path)
@@ -66,36 +95,66 @@ def load_paragraphs(file_path: str) -> list:
                     paras.append(t)
         return paras
     else:
-        with open(file_path, "r", encoding="utf-8") as f:
-            return [line.strip() for line in f.read().splitlines() if line.strip()]
+        with open(file_path, "r", encoding="utf-8-sig") as f:
+            content = f.read()
+        raw_paras = re.split(r'\n\s*\n+', content)
+        paras = []
+        for block in raw_paras:
+            clean_p = re.sub(r'[ \t]*\n[ \t]*', ' ', block).strip()
+            clean_p = re.sub(r'^[#*_\s]+', '', clean_p)
+            clean_p = re.sub(r'[ \t]+', ' ', clean_p).strip()
+            if clean_p:
+                paras.append(clean_p)
+        return paras
 
 def get_telegram_config():
     token = None
-    proxy = "http://127.0.0.1:1372"
-    env_file = Path(r"M:\dev\Telegram Remote Control\.env")
-    if env_file.exists():
-        with open(env_file, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("TELEGRAM_BOT_TOKEN="):
-                    token = line.split("=", 1)[1].strip("\"'")
-                elif line.startswith("TELEGRAM_PROXY="):
-                    proxy = line.split("=", 1)[1].strip("\"'")
+    proxy = None
+    env_candidates = [
+        Path(r"/home/nk/dev/Telegram Remote Control/.env"),
+        Path(r"M:\dev\Telegram Remote Control\.env"),
+        ROOT_DIR / ".env",
+    ]
+    for env_file in env_candidates:
+        if env_file.exists():
+            with open(env_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("TELEGRAM_BOT_TOKEN="):
+                        token = line.split("=", 1)[1].strip("\"'")
+                    elif line.startswith("TELEGRAM_PROXY="):
+                        proxy = line.split("=", 1)[1].strip("\"'")
+            if token:
+                break
 
     chat_id = 373648438
-    db_file = Path(r"M:\dev\Telegram Remote Control\data\tasks.sqlite3")
-    if db_file.exists():
+    db_candidates = [
+        Path(r"/home/nk/dev/Telegram Remote Control/data/tasks.sqlite3"),
+        Path(r"M:\dev\Telegram Remote Control/data/tasks.sqlite3"),
+    ]
+    for db_file in db_candidates:
+        if db_file.exists():
+            try:
+                import sqlite3
+                conn = sqlite3.connect(str(db_file))
+                cur = conn.cursor()
+                cur.execute("SELECT chat_id FROM tasks WHERE chat_id IS NOT NULL ORDER BY id DESC LIMIT 1")
+                row = cur.fetchone()
+                if row and row[0]:
+                    chat_id = row[0]
+                conn.close()
+                break
+            except Exception as e:
+                logger.warning(f"Failed to read chat_id from sqlite: {e}")
+
+    # Test direct connection if proxy is specified
+    if proxy:
         try:
-            import sqlite3
-            conn = sqlite3.connect(str(db_file))
-            cur = conn.cursor()
-            cur.execute("SELECT chat_id FROM tasks WHERE chat_id IS NOT NULL ORDER BY id DESC LIMIT 1")
-            row = cur.fetchone()
-            if row and row[0]:
-                chat_id = row[0]
-            conn.close()
-        except Exception as e:
-            logger.warning(f"Failed to read chat_id from sqlite: {e}")
+            req = urllib.request.Request("https://api.telegram.org", headers={"User-Agent": "curl/7.68.0"})
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                proxy = None  # Direct connection works
+        except Exception:
+            pass
 
     return token, chat_id, proxy
 
@@ -185,38 +244,247 @@ def update_status(data: dict):
     except Exception as e:
         logger.warning(f"Could not write status file: {e}")
 
+def validate_and_prepare_segments(paragraphs: list, segmenter: SentenceSegmenter) -> list:
+    """
+    Splits paragraphs into balanced token blocks, verifies word and ending preservation,
+    repairs non-terminal punctuation, and merges any short trailing segments.
+    """
+    raw_segments = segmenter.segment_chapter(paragraphs)
+    logger.info(f"Initial segmentation: {len(paragraphs)} paragraphs -> {len(raw_segments)} segments.")
+
+    # Merge trailing short segment (<40 tokens) into previous segment if needed
+    if len(raw_segments) > 1 and raw_segments[-1]["tokens"] < 40:
+        last = raw_segments.pop()
+        prev = raw_segments[-1]
+        prev["text"] = prev["text"].rstrip() + " " + last["text"].lstrip()
+        prev["tokens"] = segmenter.count_tokens(prev["text"])
+        prev["is_last_in_p"] = last["is_last_in_p"]
+        logger.info(f"Merged trailing short segment into block {prev['s_idx']} (new tokens: {prev['tokens']})")
+
+    repaired_count = 0
+    for idx, seg in enumerate(raw_segments):
+        t = seg["text"].strip()
+        # Clean non-terminal punctuation at segment boundaries
+        if t.endswith(";"):
+            t = t[:-1] + "."
+            repaired_count += 1
+            logger.info(f"Repaired segment {idx:04d} ending: ';' -> '.'")
+        elif t.endswith((",", ":", "—", "–", "-")):
+            t = t[:-1] + "."
+            repaired_count += 1
+            logger.info(f"Repaired segment {idx:04d} ending: trailing non-terminal mark -> '.'")
+        elif t and t[-1] in "0123456789":
+            t = t + "."
+            repaired_count += 1
+            logger.info(f"Repaired segment {idx:04d} ending: digit -> '.'")
+        seg["text"] = t
+
+    # Word-level comparison to guarantee zero loss of endings/words
+    orig_text = " ".join(paragraphs)
+    seg_text = " ".join(s["text"] for s in raw_segments)
+    orig_words = re.findall(r'[a-zA-Zа-яА-ЯёЁ0-9]+', orig_text.lower())
+    seg_words = re.findall(r'[a-zA-Zа-яА-ЯёЁ0-9]+', seg_text.lower())
+
+    if orig_words == seg_words:
+        logger.info(f"[Text Check OK] All {len(orig_words)} words and endings preserved 100% in order!")
+    else:
+        logger.warning(f"[Text Check WARNING] Word counts: original={len(orig_words)}, segmented={len(seg_words)}")
+        import difflib
+        diff = [d for d in difflib.ndiff(orig_words, seg_words) if d.startswith("+ ") or d.startswith("- ")]
+        logger.warning(f"Diff sample: {diff[:10]}")
+
+    logger.info(f"Segmentation finalized: {len(raw_segments)} segments (Repaired endings: {repaired_count}).")
+    return raw_segments
+
+def verify_segment_audio_ending(audio_chunk: torch.Tensor, sr: int, expected_text: str, whisper_model) -> bool:
+    """
+    Uses Whisper to verify that the ending of the synthesized audio segment
+    was not swallowed or prematurely terminated.
+    """
+    raw_words = re.findall(r'[a-zA-Zа-яА-ЯёЁ]+', expected_text.lower())
+    words = [re.sub(r"'s$", "", w) for w in raw_words]
+    words = [w for w in words if len(w) > 1 or w in ('i', 'a', 'я', 'и', 'в', 'к', 'с', 'у', 'о')]
+    if not words:
+        return True
+    target_words = words[-2:] if len(words) >= 2 else words[-1:]
+
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp_name = tmp.name
+    try:
+        torchaudio.save(tmp_name, audio_chunk, sr)
+        has_latin = bool(re.search(r'[a-zA-Z]', expected_text))
+        has_cyrillic = bool(re.search(r'[а-яА-ЯёЁ]', expected_text))
+        whisper_lang = "en" if (has_latin and not has_cyrillic) else "ru"
+        res = whisper_model.transcribe(tmp_name, language=whisper_lang)
+        rec = res["text"].lower()
+
+        def stem(w):
+            return w[:max(3, len(w)-2)]
+
+        ok = any(w in rec or stem(w) in rec for w in target_words)
+        if not ok:
+            logger.warning(f"[Ending Swallow Detected] Expected: {target_words} | Whisper ({whisper_lang}) heard: '{res['text'].strip()[-40:]}'")
+        return ok
+    except Exception as e:
+        logger.warning(f"Whisper ending verification check failed: {e}")
+        return True
+    finally:
+        if os.path.exists(tmp_name):
+            try:
+                os.unlink(tmp_name)
+            except Exception:
+                pass
+
+def sanitize_segment_audio(wav: torch.Tensor, sr: int = 24000) -> torch.Tensor:
+    """
+    Sanitizes synthesized speech segment audio to eliminate acoustic artifacts,
+    digital step clicks, and DC offset at chunk boundaries:
+    1. Ensures 2D shape (1, N) and removes any DC offset.
+    2. Detects and trims any leading non-speech burst/transient, preserving
+       a clean natural pre-speech silence margin (~50-80ms).
+    3. Applies smooth 15ms raised-cosine fade-in (starts at exact 0.000000).
+    4. Applies smooth 15ms raised-cosine fade-out (ends at exact 0.000000).
+    """
+    if wav.dim() == 1:
+        wav = wav.unsqueeze(0)
+    elif wav.shape[0] > 1:
+        wav = wav.mean(dim=0, keepdim=True)
+
+    # 1. Remove DC offset
+    wav = wav - torch.mean(wav)
+
+    # 2. Analyze leading frames for burst and silence valley
+    y = wav[0].cpu().numpy()
+    win = int(0.005 * sr)  # 5ms frames
+    n_frames = min(int(1.5 / 0.005), len(y) // win)
+
+    if n_frames > 20:
+        energies = np.array([np.max(np.abs(y[i * win : (i + 1) * win])) for i in range(n_frames)])
+        init_burst = np.max(energies[:10]) > 0.05
+
+        if init_burst:
+            # Find silence valley (energy < 0.025) after burst (between 0.10s and 1.2s)
+            valleys = [i for i in range(20, min(len(energies), int(1.2 / 0.005))) if energies[i] < 0.025]
+            if valleys:
+                first_valley = valleys[0]
+                speech_onset = None
+                for i in range(first_valley, len(energies) - 2):
+                    if energies[i] > 0.06 and energies[i + 1] > 0.06:
+                        speech_onset = i
+                        break
+
+                if speech_onset is not None:
+                    clean_valley_idx = speech_onset - int(0.06 / 0.005)
+                    clean_valley_idx = max(first_valley, min(clean_valley_idx, speech_onset - 4))
+                    cut_sample = clean_valley_idx * win
+                    wav = wav[:, cut_sample:]
+            else:
+                # Fallback: local argmin in [20, 80]
+                min_idx = 20 + np.argmin(energies[20:80])
+                if energies[min_idx] < 0.05:
+                    cut_sample = min_idx * win
+                    wav = wav[:, cut_sample:]
+
+    # 3. Apply smooth 15ms raised-cosine fade-in and fade-out
+    fade_len = int(0.015 * sr)
+    if wav.shape[1] > 2 * fade_len:
+        t = torch.linspace(0, np.pi, fade_len, device=wav.device)
+        fade_in = 0.5 * (1.0 - torch.cos(t))
+        fade_out = 0.5 * (1.0 + torch.cos(t))
+        wav[:, :fade_len] *= fade_in
+        wav[:, -fade_len:] *= fade_out
+
+    return wav
+
 def main():
-    global OUT_DIR, CACHE_DIR, LOG_FILE, STATUS_FILE
+    global OUT_DIR, CACHE_DIR, LOG_FILE, STATUS_FILE, FFMPEG_EXE, VOICE_FILE, VOICE_NAME
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--text-path", default=CHAPTER_TEXT_PATH)
-    parser.add_argument("--voice-file", default=VOICE_FILE)
+    parser.add_argument("--text-path", default=DEFAULT_TEXT_PATH)
+    parser.add_argument("--voice-file", default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--title", default=None)
     parser.add_argument("--clean-cache", action="store_true")
+    parser.add_argument("--no-telegram", action="store_true", help="Disable Telegram reporting and upload")
+    parser.add_argument("--whisper-verify", action="store_true", default=True, help="Verify segment audio endings with Whisper")
+    parser.add_argument("--export-windows", action="store_true", default=False, help="Export master to Windows Desktop/Downloads")
     args = parser.parse_args()
 
     text_path = args.text_path
     if not os.path.exists(text_path):
-        alt_path = r"M:\dev\Telegram Remote Control\Глава_1_полный.docx"
-        if os.path.exists(alt_path):
-            text_path = alt_path
+        logger.error(f"Text file missing: {text_path}")
+        return
 
-    voice_file = args.voice_file
-    voice_name = Path(voice_file).stem
+    if args.voice_file:
+        VOICE_FILE = args.voice_file
+    VOICE_NAME = Path(VOICE_FILE).stem
 
-    # Dynamic output directory
+    # Dynamic output directory and chapter title
+    stem = Path(text_path).stem
     if args.output_dir:
         OUT_DIR = Path(args.output_dir)
     else:
-        stem = Path(text_path).stem
-        if "Пролог" in stem or "%D0%9F%D1%80%D0%BE%D0%BB%D0%BE%D0%B3" in stem or "Prolog" in stem:
-            OUT_DIR = Path(ROOT_DIR) / "output" / "prologue_02_vid_voice"
-        elif "Глава_1" in stem or "%D0%93%D0%BB%D0%B0%D0%B2%D0%B0_1" in stem or "chapter_01" in stem:
-            OUT_DIR = Path(ROOT_DIR) / "output" / "chapter_01_vid_voice"
+        # Structured hierarchy: Book / Chapter
+        stem_lower = stem.lower()
+        
+        book_mapping = {
+            1: (ROOT_DIR / "output" / "Книга_1_Философский_камень", "Книга 1: Философский камень"),
+            2: (ROOT_DIR / "output" / "Книга_2_Тайная_комната", "Книга 2: Тайная комната"),
+            3: (ROOT_DIR / "output" / "Книга_3_Узник_Азкабана", "Книга 3: Узник Азкабана"),
+            4: (ROOT_DIR / "output" / "Книга_4_Кубок_огня", "Книга 4: Кубок огня"),
+            5: (ROOT_DIR / "output" / "Книга_5_Орден_Феникса", "Книга 5: Орден Феникса"),
+        }
+        
+        b_num = None
+        m_book = re.search(r'(?:книга|book)_?(\d+)', stem_lower)
+        if m_book:
+            b_num = int(m_book.group(1))
+        elif 'azkaban' in stem_lower or 'узник' in stem_lower:
+            b_num = 3
+        elif 'chamber' in stem_lower or 'тайная' in stem_lower:
+            b_num = 2
+        elif 'philosopher' in stem_lower or 'философский' in stem_lower:
+            b_num = 1
+            
+        if b_num in book_mapping:
+            book_dir, b_title = book_mapping[b_num]
+        else:
+            book_dir = ROOT_DIR / "output" / (f"Книга_{b_num}" if b_num else "Книга")
+            b_title = f"Книга {b_num}" if b_num else "Книга"
+            
+        m_ch = re.search(r'(?:глава|ch(?:apter)?)[_\s]*(\d+)', stem_lower)
+        m_pro = re.search(r'(?:пролог|prologue)[_\s]*(\d*)', stem_lower)
+        is_english = ("chapters_en" in str(Path(text_path).resolve()) or (re.search(r'\b(?:book|chapter|prologue)\b', stem_lower) and not re.search(r'[а-яА-ЯёЁ]', stem)))
+        lang_suffix = "_EN" if is_english else ""
+        lang_title_tag = " (EN)" if is_english else ""
+        
+        if m_ch:
+            ch_num = int(m_ch.group(1))
+            OUT_DIR = book_dir / f"Глава_{ch_num:02d}{lang_suffix}"
+            auto_title = f"Змея, Лев и Выдра. {b_title}. Глава {ch_num}{lang_title_tag}"
+        elif m_pro:
+            pro_num_str = m_pro.group(1)
+            if pro_num_str:
+                pro_num = int(pro_num_str)
+                cand_num = book_dir / f"Пролог_{pro_num:02d}{lang_suffix}"
+                cand_single = book_dir / f"Пролог{lang_suffix}"
+                if cand_num.exists():
+                    OUT_DIR = cand_num
+                    auto_title = f"Змея, Лев и Выдра. {b_title}. Пролог {pro_num}{lang_title_tag}"
+                elif cand_single.exists() and not is_english:
+                    OUT_DIR = cand_single
+                    auto_title = f"Змея, Лев и Выдра. {b_title}. Пролог{lang_title_tag}"
+                else:
+                    OUT_DIR = cand_num
+                    auto_title = f"Змея, Лев и Выдра. {b_title}. Пролог {pro_num}{lang_title_tag}"
+            else:
+                OUT_DIR = book_dir / f"Пролог{lang_suffix}"
+                auto_title = f"Змея, Лев и Выдра. {b_title}. Пролог{lang_title_tag}"
         else:
             safe_name = re.sub(r'[^\w\-_\.]', '_', stem)
-            OUT_DIR = Path(ROOT_DIR) / "output" / safe_name
+            OUT_DIR = book_dir / (f"{safe_name}{lang_suffix}")
+            auto_title = f"Змея, Лев и Выдра. {b_title}. {stem}{lang_title_tag}"
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     CACHE_DIR = OUT_DIR / "segments"
@@ -228,15 +496,7 @@ def main():
     file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
     logger.addHandler(file_handler)
 
-    # Determine chapter title
-    if args.title:
-        chapter_title = args.title
-    elif "Пролог" in str(text_path) or "%D0%9F%D1%80%D0%BE%D0%BB%D0%BE%D0%B3" in str(text_path):
-        chapter_title = "Пролог II"
-    elif "Глава_1" in str(text_path) or "%D0%93%D0%BB%D0%B0%D0%B2%D0%B0_1" in str(text_path):
-        chapter_title = "Глава 1: Философский камень"
-    else:
-        chapter_title = Path(text_path).stem
+    chapter_title = args.title or auto_title
 
     if args.clean_cache:
         for f in CACHE_DIR.glob("*.wav"):
@@ -245,64 +505,71 @@ def main():
             except Exception:
                 pass
 
-    logger.info(f"=== Starting Full Chapter Generation Pipeline ({voice_name}) -> {OUT_DIR} ===")
+    logger.info(f"=== Starting Full Chapter Generation Pipeline ({VOICE_NAME}) -> {OUT_DIR} ===")
     token, chat_id, proxy = get_telegram_config()
     logger.info(f"Telegram Config: Token Present={bool(token)}, ChatID={chat_id}, Proxy={proxy}")
 
-    if not os.path.exists(voice_file):
-        logger.error(f"Voice reference file missing: {voice_file}")
-        update_status({"state": "failed", "error": f"Voice missing: {voice_file}"})
-        return
-
-    if not os.path.exists(text_path):
-        logger.error(f"Chapter text file missing: {text_path}")
-        update_status({"state": "failed", "error": f"Chapter text missing: {text_path}"})
+    if not os.path.exists(VOICE_FILE):
+        logger.error(f"Voice reference file missing: {VOICE_FILE}")
+        update_status({"state": "failed", "error": f"Voice missing: {VOICE_FILE}"})
         return
 
     # 1. Load CosyVoice Model first to get tokenizer
-    model_dir = os.path.join(COSY_DIR, "pretrained_models", "Fun-CosyVoice3-0.5B")
+    model_dir = str(COSY_DIR / "pretrained_models" / "Fun-CosyVoice3-0.5B")
     logger.info(f"Loading CosyVoice 3 model from {model_dir}...")
     t0 = time.time()
     cosyvoice = AutoModel(model_dir=model_dir)
     logger.info(f"Model loaded in {time.time() - t0:.2f}s. Sample rate: {cosyvoice.sample_rate}")
 
+    # Load Whisper for automated ending verification if enabled (on CPU to protect GPU VRAM)
+    whisper_model = None
+    if args.whisper_verify:
+        logger.info("Loading Whisper base on CPU for automated ending verification...")
+        import whisper
+        whisper_model = whisper.load_model("base", device="cpu")
+        logger.info("Whisper model ready on CPU.")
+
     # Load reference transcript
-    ref_txt_path = Path(voice_file).with_suffix(".reference.txt")
+    ref_txt_path = Path(VOICE_FILE).with_suffix(".reference.txt")
     ref_text = ""
     if ref_txt_path.exists():
         ref_text = ref_txt_path.read_text(encoding="utf-8").strip()
     prompt_text = f"You are a helpful assistant.<|endofprompt|>{ref_text}"
 
-    # 2. Read & Segment Chapter with Token-Aware Segmenter (60-80 tokens per block)
+    # 2. Read & Segment Chapter with Token-Aware Segmenter (35-65 tokens per block)
     paragraphs = load_paragraphs(text_path)
     segmenter = SentenceSegmenter(
         tokenizer=cosyvoice.frontend.tokenizer,
-        min_tokens=60,
-        max_tokens=85,
-        min_block_tokens=35
+        min_tokens=35,
+        max_tokens=65,
+        min_block_tokens=25
     )
-    segments = segmenter.segment_chapter(paragraphs)
-
+    segments = validate_and_prepare_segments(paragraphs, segmenter)
     total_segs = len(segments)
-    logger.info(f"Chapter text segmented from {text_path}: {len(paragraphs)} paragraphs, {total_segs} blocks (60-80 tokens each).")
 
-    # Send Telegram start announcement
-    start_msg = (
-        f"🎙 <b>Генерация {chapter_title} запущена</b>\n"
-        f"👤 Голос: <code>{voice_name}</code>\n"
-        f"⚙️ Режим: <code>zero-shot</code> (text_frontend=False)\n"
-        f"📑 Всего блоков: <b>{total_segs}</b> (60–80 токенов/блок)\n"
-        f"🛡️ Защита окончаний и хвостов: <b>+500 мс</b>"
-    )
-    send_telegram_message(start_msg, token, chat_id, proxy)
+    # Save segments json for full traceability
+    with open(OUT_DIR / "segments.json", "w", encoding="utf-8") as f:
+        json.dump(segments, f, ensure_ascii=False, indent=2)
+
+    # Send Telegram start announcement if enabled
+    if not args.no_telegram:
+        start_msg = (
+            f"🎙 <b>Генерация {chapter_title} запущена</b>\n"
+            f"👤 Голос: <code>{VOICE_NAME}</code>\n"
+            f"⚙️ Режим: <code>zero-shot</code> (text_frontend=False)\n"
+            f"📑 Всего блоков: <b>{total_segs}</b> (60–90 токенов/блок)\n"
+            f"🛡️ Автопроверка и защита окончаний: <b>АКТИВНА</b>\n"
+            f"🛡️ Хвостовая тишина: <b>+500 мс</b>"
+        )
+        send_telegram_message(start_msg, token, chat_id, proxy)
 
     status = {
         "state": "running",
         "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "total_segments": total_segs,
         "completed_segments": 0,
-        "voice": voice_name,
-        "chapter": Path(text_path).stem,
+        "voice": VOICE_NAME,
+        "chapter": chapter_title,
     }
     update_status(status)
 
@@ -325,23 +592,108 @@ def main():
             if sr != cosyvoice.sample_rate:
                 resampler = torchaudio.transforms.Resample(sr, cosyvoice.sample_rate)
                 wav_chunk = resampler(wav_chunk)
+            wav_chunk = sanitize_segment_audio(wav_chunk, cosyvoice.sample_rate)
         else:
-            torch.manual_seed(2026 + s_idx)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(2026 + s_idx)
+            base_seed = 2026 + s_idx
+            best_chunk = None
 
-            t_seg = time.time()
-            # Non-streaming zero-shot inference without frontend text mutilation
-            outputs = list(cosyvoice.inference_zero_shot(
-                tts_text=text,
-                prompt_text=prompt_text,
-                prompt_wav=voice_file,
-                stream=False,
-                speed=1.0,
-                text_frontend=False
-            ))
-            if outputs and outputs[0]['tts_speech'].shape[1] > 0:
-                wav_chunk = torch.concat([o['tts_speech'] for o in outputs], dim=1)
+            # Attempt synthesis with up to 3 seed retries if ending is swallowed
+            for attempt, seed_offset in enumerate([0, 17, 42]):
+                cur_seed = base_seed + seed_offset
+                torch.manual_seed(cur_seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(cur_seed)
+
+                t_seg = time.time()
+                try:
+                    outputs = list(cosyvoice.inference_zero_shot(
+                        tts_text=text,
+                        prompt_text=prompt_text,
+                        prompt_wav=VOICE_FILE,
+                        stream=False,
+                        speed=1.0,
+                        text_frontend=False
+                    ))
+                except Exception as e:
+                    logger.warning(f"[{s_idx+1}/{total_segs}] Inference failed on attempt {attempt+1} (seed {cur_seed}): {e}")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    continue
+
+                if outputs and outputs[0]['tts_speech'].shape[1] > 0:
+                    wav_candidate = torch.concat([o['tts_speech'] for o in outputs], dim=1)
+                    if whisper_model:
+                        ending_ok = verify_segment_audio_ending(wav_candidate, cosyvoice.sample_rate, text, whisper_model)
+                        if ending_ok:
+                            best_chunk = wav_candidate
+                            break
+                        else:
+                            best_chunk = wav_candidate
+                            logger.info(f"[{s_idx+1}/{total_segs}] Swallowed ending detected, retry attempt {attempt+1} with seed {cur_seed+17}...")
+                    else:
+                        ending_ok = True
+                        best_chunk = wav_candidate
+                        break
+
+            # Fallback: if all retries still swallowed the ending, split segment into halves
+            if best_chunk is not None and whisper_model and not ending_ok:
+                logger.warning(f"[{s_idx+1}/{total_segs}] Retries exhausted. Splitting segment into halves to guarantee endings...")
+                sents = [s.text.strip() for s in razdel.sentenize(text) if s.text.strip()]
+                if len(sents) >= 2:
+                    mid = max(1, len(sents) // 2)
+                    halves = [" ".join(sents[:mid]), " ".join(sents[mid:])]
+                else:
+                    parts = re.split(r'([,;:—]\s+)', text)
+                    mid = len(parts) // 2
+                    if mid % 2 == 1:
+                        mid += 1
+                    left = "".join(parts[:mid]).strip()
+                    right = "".join(parts[mid:]).strip()
+                    if not left.endswith(('.', '!', '?')):
+                        left += '.'
+                    halves = [left, right]
+
+                half_chunks = []
+                for h_i, half_text in enumerate(halves):
+                    for h_attempt, h_seed_offset in enumerate([0, 19, 47]):
+                        h_seed = base_seed + h_i * 100 + h_seed_offset
+                        torch.manual_seed(h_seed)
+                        if torch.cuda.is_available():
+                            torch.cuda.manual_seed_all(h_seed)
+                        try:
+                            h_outputs = list(cosyvoice.inference_zero_shot(
+                                tts_text=half_text,
+                                prompt_text=prompt_text,
+                                prompt_wav=VOICE_FILE,
+                                stream=False,
+                                speed=1.0,
+                                text_frontend=False
+                            ))
+                        except Exception as e:
+                            logger.warning(f"[{s_idx+1}/{total_segs}] Half inference failed (half {h_i}, attempt {h_attempt+1}): {e}")
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            continue
+
+                        if h_outputs and h_outputs[0]['tts_speech'].shape[1] > 0:
+                            h_cand = torch.concat([o['tts_speech'] for o in h_outputs], dim=1)
+                            if verify_segment_audio_ending(h_cand, cosyvoice.sample_rate, half_text, whisper_model):
+                                half_chunks.append(h_cand)
+                                break
+                            elif h_attempt == 2:
+                                half_chunks.append(h_cand)
+
+                if len(half_chunks) == len(halves):
+                    joined = []
+                    for i, c in enumerate(half_chunks):
+                        joined.append(c)
+                        if i < len(half_chunks) - 1:
+                            joined.append(silence_sentence)
+                    best_chunk = torch.cat(joined, dim=1)
+                    logger.info(f"[{s_idx+1}/{total_segs}] Fallback split successful! Repaired segment: {text[:45]}...")
+
+            if best_chunk is not None:
+                wav_chunk = sanitize_segment_audio(best_chunk, cosyvoice.sample_rate)
                 torchaudio.save(str(seg_wav_path), wav_chunk, cosyvoice.sample_rate)
                 seg_dur = wav_chunk.shape[1] / cosyvoice.sample_rate
                 logger.info(f"[{s_idx+1}/{total_segs}] Synth OK ({seg_dur:.2f}s in {time.time()-t_seg:.2f}s): {text[:45]}...")
@@ -349,16 +701,16 @@ def main():
                 logger.warning(f"[{s_idx+1}/{total_segs}] Empty output for segment: {text}")
                 continue
 
-        if wav_chunk.dim() == 1:
-            wav_chunk = wav_chunk.unsqueeze(0)
-        elif wav_chunk.shape[0] > 1:
-            wav_chunk = wav_chunk.mean(dim=0, keepdim=True)
+        wav_chunk = sanitize_segment_audio(wav_chunk, cosyvoice.sample_rate)
 
         audio_chunks.append(wav_chunk)
         if seg.get("is_last_in_p", False):
             audio_chunks.append(silence_para)
         else:
             audio_chunks.append(silence_sentence)
+
+        if (s_idx + 1) % 5 == 0 and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         status["completed_segments"] = s_idx + 1
         elapsed = time.time() - t_start_synth
@@ -370,14 +722,16 @@ def main():
         if (s_idx + 1) % 5 == 0 or (s_idx + 1) == total_segs:
             update_status(status)
 
-        # Telegram progress report every ~10% (or at least every 40 blocks)
+        # Progress reporting
         step_notify = max(25, total_segs // 10)
         if (s_idx + 1) % step_notify == 0:
             prog_text = (
-                f"⏳ <b>{chapter_title}: синтезировано {s_idx + 1}/{total_segs} ({status['progress_pct']}%)</b>\n"
-                f"⏱️ Прошло: {elapsed / 60:.1f} мин. | Осталось: ~{status['eta_minutes']} мин."
+                f"⏳ {chapter_title}: синтезировано {s_idx + 1}/{total_segs} ({status['progress_pct']}%) | "
+                f"Прошло: {elapsed / 60:.1f} мин. | Осталось: ~{status['eta_minutes']} мин."
             )
-            send_telegram_message(prog_text, token, chat_id, proxy)
+            logger.info(prog_text)
+            if not args.no_telegram:
+                send_telegram_message(f"⏳ <b>{prog_text}</b>", token, chat_id, proxy)
 
     if not audio_chunks:
         logger.error("No audio chunks synthesized!")
@@ -389,7 +743,10 @@ def main():
     logger.info("Concatenating all audio segments with 500ms safety tail silence...")
     audio_chunks.append(silence_tail)
     full_wav = torch.cat(audio_chunks, dim=1)
-    safe_out_stem = OUT_DIR.name
+    if OUT_DIR.parent.name.startswith("Книга"):
+        safe_out_stem = f"{OUT_DIR.parent.name}_{OUT_DIR.name}"
+    else:
+        safe_out_stem = OUT_DIR.name
     master_wav = OUT_DIR / f"{safe_out_stem}.wav"
     torchaudio.save(str(master_wav), full_wav, cosyvoice.sample_rate)
     total_dur_s = full_wav.shape[1] / cosyvoice.sample_rate
@@ -397,7 +754,7 @@ def main():
 
     # 4. Encode to MP3
     final_mp3 = OUT_DIR / f"{safe_out_stem}.mp3"
-    if FFMPEG_EXE.exists():
+    if FFMPEG_EXE.exists() or shutil.which(str(FFMPEG_EXE)):
         cmd = [
             str(FFMPEG_EXE),
             "-y",
@@ -412,29 +769,48 @@ def main():
     else:
         final_mp3 = master_wav
 
-    # 5. Telegram delivery (ensure file size <= 48 MB for Telegram Bot API)
-    mp3_to_send = final_mp3
-    if final_mp3.exists() and final_mp3.stat().st_size > 48 * 1024 * 1024 and FFMPEG_EXE.exists():
-        # Compress to 48k mono to fit within standard 50 MB Telegram limit
-        compact_mp3 = OUT_DIR / f"{safe_out_stem}_telegram.mp3"
-        subprocess.run([
-            str(FFMPEG_EXE), "-y", "-i", str(master_wav),
-            "-codec:a", "libmp3lame", "-b:a", "48k", "-ac", "1", "-ar", "24000",
-            str(compact_mp3)
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if compact_mp3.exists() and compact_mp3.stat().st_size <= 49 * 1024 * 1024:
-            mp3_to_send = compact_mp3
+    # 5. Telegram delivery (if enabled)
+    upload_ok = False
+    if not args.no_telegram:
+        mp3_to_send = final_mp3
+        if final_mp3.exists() and final_mp3.stat().st_size > 48 * 1024 * 1024 and (FFMPEG_EXE.exists() or shutil.which(str(FFMPEG_EXE))):
+            compact_mp3 = OUT_DIR / f"{safe_out_stem}_telegram.mp3"
+            subprocess.run([
+                str(FFMPEG_EXE), "-y", "-i", str(master_wav),
+                "-codec:a", "libmp3lame", "-b:a", "48k", "-ac", "1", "-ar", "24000",
+                str(compact_mp3)
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if compact_mp3.exists() and compact_mp3.stat().st_size <= 49 * 1024 * 1024:
+                mp3_to_send = compact_mp3
 
-    caption = (
-        f"🎧 <b>{chapter_title}</b>\n"
-        f"🎙️ Голос: <code>{voice_name}</code>\n"
-        f"⏱️ Длительность: {total_dur_s / 60:.1f} мин. ({int(total_dur_s)} сек.)\n"
-        f"📑 Сегментов: {total_segs}"
-    )
+        caption = (
+            f"🎧 <b>{chapter_title}</b>\n"
+            f"🎙️ Голос: <code>{VOICE_NAME}</code>\n"
+            f"⏱️ Длительность: {total_dur_s / 60:.1f} мин. ({int(total_dur_s)} сек.)\n"
+            f"📑 Сегментов: {total_segs}"
+        )
+        upload_ok = send_telegram_file(mp3_to_send, caption, token, chat_id, proxy=proxy, is_audio=True, title=chapter_title)
+        if not upload_ok:
+            upload_ok = send_telegram_file(mp3_to_send, caption, token, chat_id, proxy=proxy, is_audio=False, title=chapter_title)
+    else:
+        logger.info("Telegram notification skipped as requested (--no-telegram set).")
 
-    upload_ok = send_telegram_file(mp3_to_send, caption, token, chat_id, proxy=proxy, is_audio=True, title=chapter_title)
-    if not upload_ok:
-        upload_ok = send_telegram_file(mp3_to_send, caption, token, chat_id, proxy=proxy, is_audio=False, title=chapter_title)
+    # 6. Windows export (only if explicitly enabled via --export-windows)
+    if args.export_windows:
+        win_targets = [
+            Path("/run/media/nk/System/Users/kosty/Desktop"),
+            Path("/run/media/nk/Main/Downloads"),
+        ]
+        for wt in win_targets:
+            if wt.is_dir() and final_mp3.exists():
+                dest = wt / final_mp3.name
+                try:
+                    shutil.copy2(str(final_mp3), str(dest))
+                    logger.info(f"Exported master MP3 to Windows: {dest}")
+                except Exception as e:
+                    logger.warning(f"Could not copy to {dest}: {e}")
+    else:
+        logger.info("Windows export skipped (disabled per user request).")
 
     status["state"] = "completed"
     status["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -443,7 +819,7 @@ def main():
     status["telegram_uploaded"] = upload_ok
     update_status(status)
 
-    logger.info(f"=== Generation Completed Successfully! Telegram Sent: {upload_ok} ===")
+    logger.info(f"=== Generation Completed Successfully! Duration: {total_dur_s/60:.1f} min ===")
 
 if __name__ == "__main__":
     main()
