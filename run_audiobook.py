@@ -79,7 +79,23 @@ def find_python_bin() -> Path:
     return Path(sys.executable)
 
 PYTHON_BIN = find_python_bin()
-CHAPTERS_DIR = ROOT_DIR / "output" / "Potter" / "chapters_ru"
+CHAPTERS_RU_DIR = ROOT_DIR / "output" / "Potter" / "chapters_ru"
+CHAPTERS_EN_DIR = ROOT_DIR / "output" / "Potter" / "chapters_en"
+
+def get_default_chapters_dir() -> Path:
+    override = os.environ.get("AUDIOBOOK_CHAPTERS_DIR")
+    if override and Path(override).exists():
+        return Path(override)
+    lang = os.environ.get("AUDIOBOOK_LANG", "").lower()
+    if lang == "en":
+        return CHAPTERS_EN_DIR if CHAPTERS_EN_DIR.exists() else CHAPTERS_RU_DIR
+    if CHAPTERS_RU_DIR.exists() and list(CHAPTERS_RU_DIR.glob("*.txt")):
+        return CHAPTERS_RU_DIR
+    if CHAPTERS_EN_DIR.exists() and list(CHAPTERS_EN_DIR.glob("*.txt")):
+        return CHAPTERS_EN_DIR
+    return CHAPTERS_RU_DIR
+
+CHAPTERS_DIR = get_default_chapters_dir()
 OUTPUT_DIR = ROOT_DIR / "output"
 SCRIPTS_DIR = ROOT_DIR / "scripts"
 
@@ -104,7 +120,7 @@ def parse_chapter_info(file_path: Path):
     stem_lower = stem.lower()
 
     b_num = None
-    m_book = re.search(r'(?:книга|book)_?(\d+)', stem_lower)
+    m_book = re.search(r'(?:книга|book)[_\s]*(\d+)', stem_lower)
     if m_book:
         b_num = int(m_book.group(1))
     elif 'azkaban' in stem_lower or 'узник' in stem_lower:
@@ -120,8 +136,8 @@ def parse_chapter_info(file_path: Path):
         book_dir = OUTPUT_DIR / (f"Книга_{b_num}" if b_num else "Книга")
         book_title = f"Книга {b_num}" if b_num else "Книга"
 
-    m_ch = re.search(r'(?:глава|ch(?:apter)?)_?(\d+)', stem_lower)
-    m_pro = re.search(r'(?:пролог|prologue)_?(\d*)', stem_lower)
+    m_ch = re.search(r'(?:глава|ch(?:apter)?)[_\s]*(\d+)', stem_lower)
+    m_pro = re.search(r'(?:пролог|prologue)[_\s]*(\d*)', stem_lower)
 
     if m_ch:
         ch_num = int(m_ch.group(1))
@@ -823,16 +839,21 @@ def main():
     if args.chapter_path:
         target_path = Path(args.chapter_path)
         if not target_path.exists():
-            # Check in CHAPTERS_DIR
-            candidate = CHAPTERS_DIR / args.chapter_path
-            if candidate.exists():
-                target_path = candidate
+            for search_dir in [CHAPTERS_DIR, CHAPTERS_EN_DIR, CHAPTERS_RU_DIR]:
+                if search_dir.exists():
+                    cand = search_dir / args.chapter_path
+                    if cand.exists():
+                        target_path = cand
+                        break
             else:
-                # Try finding matching file
-                matches = list(CHAPTERS_DIR.glob(f"*{args.chapter_path}*"))
-                if matches:
-                    target_path = matches[0]
-                else:
+                matches = []
+                for search_dir in [CHAPTERS_DIR, CHAPTERS_EN_DIR, CHAPTERS_RU_DIR]:
+                    if search_dir.exists():
+                        matches = list(search_dir.glob(f"*{args.chapter_path}*"))
+                        if matches:
+                            target_path = matches[0]
+                            break
+                if not target_path.exists():
                     print(c_text(f"Файл не найден: {args.chapter_path}", C_RED))
                     sys.exit(1)
 

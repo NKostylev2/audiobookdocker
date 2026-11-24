@@ -36,6 +36,8 @@ output/*
 output/Potter/*
 !output/Potter/chapters_ru/
 !output/Potter/chapters_ru/*.txt
+!output/Potter/chapters_en/
+!output/Potter/chapters_en/*.txt
 work/
 failed/
 logs/
