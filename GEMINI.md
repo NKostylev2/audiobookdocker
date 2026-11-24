@@ -56,8 +56,12 @@ Automated generation, verification, and mastering of high-quality Russian audiob
 ---
 
 ## 5. Main Execution Scripts
-- Primary pipeline: `scripts/generate_chapter_vid_voice.py`
-- Ending repair pipeline: `scripts/repair_swallowed_segments.py`
+- **Supervisor / Orchestrator:** `run_audiobook.py` (main entry point for interactive menu, `--status`, `--all`, single-chapter runs, verification and auto-repair).
+- Primary generation worker: `scripts/generate_chapter_vid_voice.py`
+- Ending post-verification: `scripts/verify_chapter_endings_gpu.py`
+- Ending auto-repair worker: `scripts/auto_repair_chapter.py`
+- Auxiliary repair: `scripts/repair_swallowed_segments.py`
+- Contract & Guards: `fanfic_pipeline/exit_codes.py`, `fanfic_pipeline/runtime_guards.py`, `fanfic_pipeline/verification.py`
 
 ---
 

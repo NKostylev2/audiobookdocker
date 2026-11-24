@@ -22,7 +22,7 @@ description: Production audiobook dubbing pipeline rules and constraints for Rus
    - Sentence pause: 200 ms. Paragraph pause: 500 ms. Final safety silence: 500 ms.
    - MP3: 128 kbps libmp3lame, 24 000 Hz.
    - Windows delivery DISABLED per user request (do not copy to Desktop or Downloads).
-   - Default script: `scripts/generate_chapter_vid_voice.py`.
+   - Default scripts: `run_audiobook.py` (supervisor / entry point) and `scripts/generate_chapter_vid_voice.py` (worker).
 5. **Output Directory Hierarchy:**
    - Saved in `/mnt/ai/AI-Dubbing/output/` strictly under `Книга_1_Философский_камень/` or `Книга_2_Тайная_комната/` with subfolders `Глава_XX` or `Пролог_XX`.
    - Tests and benchmarks live in `_Тесты_и_Бенчмарки/`.
