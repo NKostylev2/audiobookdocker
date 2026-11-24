@@ -15,6 +15,9 @@ from pathlib import Path
 
 # --- Dynamic Path Resolution (Cross-platform Windows & Linux) ---
 def find_root_dir() -> Path:
+    override = os.environ.get("AUDIOBOOK_ROOT_DIR")   # explicit root (also used by the test-suite)
+    if override and Path(override).is_dir():
+        return Path(override).resolve()
     candidates = [
         Path("/mnt/ai/AI-Dubbing"),
         Path(r"E:\AI-Dubbing"),
@@ -79,6 +82,14 @@ import torchaudio
 import razdel
 from cosyvoice.cli.cosyvoice import AutoModel
 from fanfic_pipeline.segmenter import SentenceSegmenter
+from fanfic_pipeline.exit_codes import (
+    EXIT_TEXT_MISSING, EXIT_VOICE_MISSING, EXIT_NO_AUDIO, EXIT_SEGMENTS_FAILED,
+)
+from fanfic_pipeline.runtime_guards import ThreadExceptionGuard
+from fanfic_pipeline.split_ops import split_for_fallback
+
+# CosyVoice decodes in a worker thread and swallows its exceptions (see runtime_guards.py)
+THREAD_GUARD = ThreadExceptionGuard()
 
 def load_paragraphs(file_path: str) -> list:
     p = Path(file_path)
@@ -414,7 +425,7 @@ def main():
     text_path = args.text_path
     if not os.path.exists(text_path):
         logger.error(f"Text file missing: {text_path}")
-        return
+        sys.exit(EXIT_TEXT_MISSING)
 
     if args.voice_file:
         VOICE_FILE = args.voice_file
@@ -422,6 +433,7 @@ def main():
 
     # Dynamic output directory and chapter title
     stem = Path(text_path).stem
+    auto_title = stem   # was assigned only in the `else` branch -> UnboundLocalError with --output-dir and no --title
     if args.output_dir:
         OUT_DIR = Path(args.output_dir)
     else:
@@ -505,14 +517,25 @@ def main():
             except Exception:
                 pass
 
+    # A new generation run invalidates the previous verification report (it described other audio).
+    try:
+        (OUT_DIR / "gpu_verification_report.json").unlink()
+    except FileNotFoundError:
+        pass
+
+    THREAD_GUARD.install()
+
     logger.info(f"=== Starting Full Chapter Generation Pipeline ({VOICE_NAME}) -> {OUT_DIR} ===")
-    token, chat_id, proxy = get_telegram_config()
+    if args.no_telegram:
+        token, chat_id, proxy = None, None, None
+    else:
+        token, chat_id, proxy = get_telegram_config()
     logger.info(f"Telegram Config: Token Present={bool(token)}, ChatID={chat_id}, Proxy={proxy}")
 
     if not os.path.exists(VOICE_FILE):
         logger.error(f"Voice reference file missing: {VOICE_FILE}")
         update_status({"state": "failed", "error": f"Voice missing: {VOICE_FILE}"})
-        return
+        sys.exit(EXIT_VOICE_MISSING)
 
     # 1. Load CosyVoice Model first to get tokenizer
     model_dir = str(COSY_DIR / "pretrained_models" / "Fun-CosyVoice3-0.5B")
@@ -578,6 +601,7 @@ def main():
     silence_tail = torch.zeros((1, int(cosyvoice.sample_rate * 0.50)))     # 500 ms tail digital silence
 
     audio_chunks = []
+    failed_segments = []   # indices that produced no audio after all attempts
     t_start_synth = time.time()
 
     for s_idx, seg in enumerate(segments):
@@ -606,6 +630,7 @@ def main():
 
                 t_seg = time.time()
                 try:
+                    THREAD_GUARD.clear()
                     outputs = list(cosyvoice.inference_zero_shot(
                         tts_text=text,
                         prompt_text=prompt_text,
@@ -614,6 +639,7 @@ def main():
                         speed=1.0,
                         text_frontend=False
                     ))
+                    THREAD_GUARD.raise_if_failed()   # a dead LLM thread would otherwise yield truncated audio silently
                 except Exception as e:
                     logger.warning(f"[{s_idx+1}/{total_segs}] Inference failed on attempt {attempt+1} (seed {cur_seed}): {e}")
                     if torch.cuda.is_available():
@@ -638,21 +664,10 @@ def main():
             # Fallback: if all retries still swallowed the ending, split segment into halves
             if best_chunk is not None and whisper_model and not ending_ok:
                 logger.warning(f"[{s_idx+1}/{total_segs}] Retries exhausted. Splitting segment into halves to guarantee endings...")
-                sents = [s.text.strip() for s in razdel.sentenize(text) if s.text.strip()]
-                if len(sents) >= 2:
-                    mid = max(1, len(sents) // 2)
-                    halves = [" ".join(sents[:mid]), " ".join(sents[mid:])]
-                else:
-                    parts = re.split(r'([,;:—]\s+)', text)
-                    mid = len(parts) // 2
-                    if mid % 2 == 1:
-                        mid += 1
-                    left = "".join(parts[:mid]).strip()
-                    right = "".join(parts[mid:]).strip()
-                    if not left.endswith(('.', '!', '?')):
-                        left += '.'
-                    halves = [left, right]
-
+                halves = split_for_fallback(text)
+                if halves is None:
+                    logger.warning(f"[{s_idx+1}/{total_segs}] No safe split point; keeping the best candidate unchanged.")
+                    halves = []
                 half_chunks = []
                 for h_i, half_text in enumerate(halves):
                     for h_attempt, h_seed_offset in enumerate([0, 19, 47]):
@@ -661,6 +676,7 @@ def main():
                         if torch.cuda.is_available():
                             torch.cuda.manual_seed_all(h_seed)
                         try:
+                            THREAD_GUARD.clear()
                             h_outputs = list(cosyvoice.inference_zero_shot(
                                 tts_text=half_text,
                                 prompt_text=prompt_text,
@@ -669,6 +685,7 @@ def main():
                                 speed=1.0,
                                 text_frontend=False
                             ))
+                            THREAD_GUARD.raise_if_failed()
                         except Exception as e:
                             logger.warning(f"[{s_idx+1}/{total_segs}] Half inference failed (half {h_i}, attempt {h_attempt+1}): {e}")
                             if torch.cuda.is_available():
@@ -683,7 +700,7 @@ def main():
                             elif h_attempt == 2:
                                 half_chunks.append(h_cand)
 
-                if len(half_chunks) == len(halves):
+                if halves and len(half_chunks) == len(halves):
                     joined = []
                     for i, c in enumerate(half_chunks):
                         joined.append(c)
@@ -698,7 +715,8 @@ def main():
                 seg_dur = wav_chunk.shape[1] / cosyvoice.sample_rate
                 logger.info(f"[{s_idx+1}/{total_segs}] Synth OK ({seg_dur:.2f}s in {time.time()-t_seg:.2f}s): {text[:45]}...")
             else:
-                logger.warning(f"[{s_idx+1}/{total_segs}] Empty output for segment: {text}")
+                logger.error(f"[{s_idx+1}/{total_segs}] Segment could not be synthesized after all attempts: {text}")
+                failed_segments.append(s_idx)
                 continue
 
         wav_chunk = sanitize_segment_audio(wav_chunk, cosyvoice.sample_rate)
@@ -733,11 +751,22 @@ def main():
             if not args.no_telegram:
                 send_telegram_message(f"⏳ <b>{prog_text}</b>", token, chat_id, proxy)
 
+    if failed_segments:
+        # A silently missing segment is a hole in the book. Do not assemble / upload a master with gaps;
+        # the cache is kept, so re-running resumes and retries only the missing segments.
+        logger.error(f"{len(failed_segments)} segment(s) could not be synthesized: {failed_segments}. "
+                     f"Master NOT assembled; re-run to resume from cache.")
+        status["state"] = "failed"
+        status["error"] = "segments_failed"
+        status["failed_segments"] = failed_segments
+        update_status(status)
+        sys.exit(EXIT_SEGMENTS_FAILED)
+
     if not audio_chunks:
         logger.error("No audio chunks synthesized!")
         status["state"] = "failed"
         update_status(status)
-        return
+        sys.exit(EXIT_NO_AUDIO)
 
     # 3. Assemble Master Audio with trailing digital silence
     logger.info("Concatenating all audio segments with 500ms safety tail silence...")

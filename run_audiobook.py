@@ -24,7 +24,12 @@ import time
 import shutil
 import argparse
 import subprocess
+from collections import deque
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # make fanfic_pipeline importable from any cwd
+from fanfic_pipeline.exit_codes import EXIT_OK, EXIT_BATCH_FAILED, EXIT_BATCH_NEEDS_REVIEW, EXIT_REPAIR_INCOMPLETE
+from fanfic_pipeline.verification import run_verification
 
 # --- ANSI Color Codes for Terminal UI ---
 C_RESET = "\033[0m"
@@ -278,20 +283,99 @@ def render_video_nvenc(master_mp3: Path, output_mp4: Path, bg_video: Path = None
     return True
 
 
+
+# Result of one chapter run. Previously run_pipeline_for_chapter() returned True even when
+# defects remained, and the final banner always claimed "100% verified".
+RESULT_OK = "ok"          # generated, verified, 0 unresolved defects
+RESULT_ISSUES = "issues"  # chapter assembled, but defects remain / repair did not finish cleanly
+RESULT_FAILED = "failed"  # a pipeline stage failed; the chapter is not usable as-is
+
+BATCH_CODES = ("PENDING", "IN_PROGRESS", "HAS_ISSUES", "GENERATED")
+
+_PROGRESS_MARKERS = (
+    "Synthesizing seg", "verified OK", "Retry attempt", "Master", "Full WAV", "Standard MP3",
+    # messages the generator actually logs (the filter above never matched them):
+    "Synth OK", "Swallowed ending", "Retries exhausted", "Fallback split", "Text Check",
+)
+_ERROR_RE = re.compile(r"(Traceback \(most recent call last\)|Exception in thread|^\w*(Error|Exception)\b)")
+
+
+def classify_worker_line(line: str):
+    """Returns 'warn', 'info' or None for one line of worker output.
+
+    Tracebacks and 'Exception in thread ...' used to be dropped by the filter, so a crashing
+    worker looked like a silent one.
+    """
+    if "ERROR" in line or "WARNING" in line or _ERROR_RE.search(line):
+        return "warn"
+    if any(m in line for m in _PROGRESS_MARKERS):
+        return "info"
+    if "[1/" in line or "[10/" in line or "Progress:" in line or "100%" in line:
+        return "info"
+    return None
+
+
+def plan_batch(chapters, clean_cache=False):
+    """Decides what a batch run does with each chapter. Pure function (unit-tested).
+
+    * GENERATED chapters (all segments synthesized, awaiting verification) are now included and
+      run verification only -- previously they were silently skipped forever.
+    * --clean-cache never wipes IN_PROGRESS (hours of partial synthesis) or GENERATED chapters.
+    """
+    plan = []
+    for ch in chapters:
+        code = ch["status"]["code"]
+        if code not in BATCH_CODES:
+            continue
+        warning = None
+        clean = False
+        if clean_cache:
+            if code in ("PENDING", "HAS_ISSUES"):
+                clean = True
+            else:
+                warning = (f"--clean-cache пропущен для '{ch['chap_name']}' (статус {code}): "
+                           f"кэш содержит незавершённую/непроверенную работу")
+        plan.append({
+            "chapter": ch,
+            "clean_cache": clean,
+            "skip_generation": code == "GENERATED",
+            "warning": warning,
+        })
+    return plan
+
+
+def exit_code_for(results) -> int:
+    """Process exit status for a list of RESULT_* values."""
+    if any(r == RESULT_FAILED for r in results):
+        return EXIT_BATCH_FAILED
+    if any(r == RESULT_ISSUES for r in results):
+        return EXIT_BATCH_NEEDS_REVIEW
+    return EXIT_OK
+
+
+def _print_verifier_output(output: str):
+    for line in output.splitlines():
+        if "SWALLOW ISSUE" in line or "issues" in line or "Verified [" in line or "Verification complete" in line:
+            print(f"    {line}")
+
+
 def run_pipeline_for_chapter(
     text_file: Path,
     video: bool = False,
     no_telegram: bool = False,
     clean_cache: bool = False,
     device: str = "cuda",
-    bg_video: Path = None
+    bg_video: Path = None,
+    skip_generation: bool = False
 ):
     """
     Executes the autonomous end-to-end pipeline for a single chapter:
-    1. Generation (CosyVoice 3 + Whisper CPU in-flight)
+    1. Generation (CosyVoice 3 + Whisper CPU in-flight)          [skipped if skip_generation]
     2. GPU Whisper Verification (Whisper CUDA)
-    3. Self-Healing Auto-Repair (if issues detected, loops until 0 issues)
+    3. Self-Healing Auto-Repair (if issues detected, loops until 0 issues or max passes)
     4. Optional NVENC Video Render
+
+    Returns RESULT_OK, RESULT_ISSUES or RESULT_FAILED (see module constants).
     """
     info = parse_chapter_info(text_file)
     chap_dir = info["chap_dir"]
@@ -314,41 +398,47 @@ def run_pipeline_for_chapter(
         print(c_text(f" 📊 Исходный текст: {len(content)} симв., ~{words} слов", C_WHITE))
     except Exception as e:
         print(c_text(f" ❌ Ошибка чтения файла {text_file}: {e}", C_RED))
-        return False
+        return RESULT_FAILED
 
     # -------------------------------------------------------------
     # ЭТАП 1: Синтез речи (CosyVoice 3)
     # -------------------------------------------------------------
-    print("\n" + c_text(" [1/4] СИНТЕЗ РЕЧИ (CosyVoice 3 + in-flight Whisper CPU)...", C_BOLD + C_YELLOW))
-    gen_cmd = [
-        str(PYTHON_BIN),
-        str(GENERATE_SCRIPT),
-        "--text-path", str(text_file.resolve())
-    ]
-    if no_telegram:
-        gen_cmd.append("--no-telegram")
-    if clean_cache:
-        gen_cmd.append("--clean-cache")
+    if skip_generation:
+        print("\n" + c_text(" [1/4] Синтез пропущен: все блоки уже сгенерированы (ждут верификации).", C_DIM))
+    else:
+        print("\n" + c_text(" [1/4] СИНТЕЗ РЕЧИ (CosyVoice 3 + in-flight Whisper CPU)...", C_BOLD + C_YELLOW))
+        gen_cmd = [
+            str(PYTHON_BIN),
+            str(GENERATE_SCRIPT),
+            "--text-path", str(text_file.resolve())
+        ]
+        if no_telegram:
+            gen_cmd.append("--no-telegram")
+        if clean_cache:
+            gen_cmd.append("--clean-cache")
 
-    p = subprocess.Popen(gen_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-    for line in iter(p.stdout.readline, ''):
-        line_s = line.strip()
-        if not line_s:
-            continue
-        # Filter noise, keep essential progress
-        if "Synthesizing seg" in line_s or "verified OK" in line_s or "Retry attempt" in line_s or "Master" in line_s or "Full WAV" in line_s or "Standard MP3" in line_s:
-            print(f"    {line_s}")
-        elif "ERROR" in line_s or "WARNING" in line_s:
-            print(c_text(f"    {line_s}", C_YELLOW))
-        elif "[1/" in line_s or "[10/" in line_s or "Progress:" in line_s or "100%" in line_s:
-            print(f"    {line_s}")
-    p.wait()
+        tail = deque(maxlen=30)   # last lines of worker output, shown if the worker fails
+        p = subprocess.Popen(gen_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        for line in iter(p.stdout.readline, ''):
+            line_s = line.strip()
+            if not line_s:
+                continue
+            tail.append(line_s)
+            kind = classify_worker_line(line_s)
+            if kind == "warn":
+                print(c_text(f"    {line_s}", C_YELLOW))
+            elif kind == "info":
+                print(f"    {line_s}")
+        p.wait()
 
-    if p.returncode != 0:
-        print(c_text(f" ❌ Ошибка генерации главы (код {p.returncode})!", C_RED + C_BOLD))
-        return False
+        if p.returncode != 0:
+            print(c_text(f" ❌ Ошибка генерации главы (код {p.returncode})!", C_RED + C_BOLD))
+            print(c_text("    Последние строки вывода генератора:", C_DIM))
+            for t_line in tail:
+                print(c_text(f"      {t_line}", C_DIM))
+            return RESULT_FAILED
 
-    print(c_text(" ✓ Синтез завершён. CosyVoice выгружен из VRAM.", C_GREEN))
+        print(c_text(" ✓ Синтез завершён. CosyVoice выгружен из VRAM.", C_GREEN))
 
     # -------------------------------------------------------------
     # ЭТАП 2: Пост-верификация на GPU Whisper (CUDA)
@@ -360,28 +450,23 @@ def run_pipeline_for_chapter(
         "--chapter-dir", str(chap_dir),
         "--device", device
     ]
-    v_proc = subprocess.run(verify_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    for line in v_proc.stdout.splitlines():
-        if "SWALLOW ISSUE" in line or "issues" in line or "Verified [" in line or "Verification complete" in line:
-            print(f"    {line}")
-
     report_file = chap_dir / "gpu_verification_report.json"
-    issues_count = 0
-    if report_file.exists():
-        try:
-            with open(report_file, "r", encoding="utf-8") as rf:
-                rep = json.load(rf)
-                issues_count = rep.get("issues_count", len(rep.get("issues", [])))
-        except Exception:
-            issues_count = 1 if v_proc.returncode != 0 else 0
-    else:
-        issues_count = 1 if v_proc.returncode != 0 else 0
+
+    # run_verification() deletes the previous report first, so a crashed verifier can never
+    # be mistaken for "0 issues".
+    vres = run_verification(verify_cmd, report_file)
+    _print_verifier_output(vres.output)
+    if not vres.ok:
+        print(c_text(f" ❌ Верификация не выполнена: {vres.reason}. Глава НЕ считается проверенной.", C_RED + C_BOLD))
+        return RESULT_FAILED
+    issues_count = vres.issues_count
 
     # -------------------------------------------------------------
     # ЭТАП 3: Автономное самоисцеление (Auto-Repair Loop)
     # -------------------------------------------------------------
     max_repair_passes = 3
     repair_pass = 0
+    repair_incomplete = False   # state of the LAST repair pass: master may be stale if it did not finish cleanly
 
     while issues_count > 0 and repair_pass < max_repair_passes:
         repair_pass += 1
@@ -397,24 +482,40 @@ def run_pipeline_for_chapter(
             if "Attempting self-healing" in line or "PERFECT" in line or "repaired via" in line or "Master" in line or "repaired" in line:
                 print(f"    {line}")
 
+        repair_incomplete = r_proc.returncode != 0
+        if repair_incomplete:
+            print(c_text(f"    ⚠️ Самоисцеление завершилось с кодом {r_proc.returncode}: "
+                         f"часть сегментов не исправлена или мастер не пересобран.", C_YELLOW + C_BOLD))
+            if r_proc.returncode != EXIT_REPAIR_INCOMPLETE:
+                for t_line in r_proc.stdout.splitlines()[-15:]:
+                    print(c_text(f"      {t_line}", C_DIM))
+
         # Re-verify on GPU
         print(c_text(f"    Повторная проверка на GPU после исцеления...", C_CYAN))
-        v_proc = subprocess.run(verify_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        if report_file.exists():
-            with open(report_file, "r", encoding="utf-8") as rf:
-                rep = json.load(rf)
-                issues_count = rep.get("issues_count", len(rep.get("issues", [])))
+        vres = run_verification(verify_cmd, report_file)
+        _print_verifier_output(vres.output)
+        if not vres.ok:
+            print(c_text(f" ❌ Повторная верификация не выполнена: {vres.reason}. Результат ремонта неизвестен.", C_RED + C_BOLD))
+            return RESULT_FAILED
+        issues_count = vres.issues_count
 
         if issues_count == 0:
-            print(c_text(f"    ✓ Все сегменты успешно исцелены! 0 проглоченных окончаний.", C_GREEN + C_BOLD))
+            if repair_incomplete:
+                print(c_text("    Верификатор больше не видит дефектов, но ремонт завершился с ошибкой.", C_YELLOW))
+            else:
+                print(c_text("    ✓ Верификатор больше не видит дефектов окончаний.", C_GREEN + C_BOLD))
             break
         else:
             print(c_text(f"    Осталось дефектов после исцеления: {issues_count}", C_YELLOW))
 
-    if issues_count == 0:
-        print(c_text(" ✓ Верификация подтверждена: 100% точность, 0 проглоченных окончаний!", C_GREEN + C_BOLD))
-    else:
+    clean = issues_count == 0 and not repair_incomplete
+    if clean:
+        print(c_text(" ✓ Верификация пройдена: дефектов окончаний не найдено.", C_GREEN + C_BOLD))
+    elif issues_count > 0:
         print(c_text(f" ⚠️ Внимание: после {repair_pass} проходов исцеления осталось {issues_count} спорных мест.", C_YELLOW + C_BOLD))
+    else:
+        print(c_text(" ⚠️ Внимание: последний проход самоисцеления завершился с ошибкой; "
+                     "мастер мог не быть пересобран. Повторите: run_audiobook.py <глава> --repair-only", C_YELLOW + C_BOLD))
 
     # -------------------------------------------------------------
     # ЭТАП 4: Опциональный NVENC Видеорендер
@@ -434,7 +535,10 @@ def run_pipeline_for_chapter(
 
     # Summary Display
     print("\n" + "=" * 76)
-    print(c_text(f" 🎉 ГЛАВА УСПЕШНО ГОТОВА: {book_title} — {chap_name}", C_BOLD + C_GREEN))
+    if clean:
+        print(c_text(f" 🎉 ГЛАВА УСПЕШНО ГОТОВА: {book_title} — {chap_name}", C_BOLD + C_GREEN))
+    else:
+        print(c_text(f" ⚠️ ГЛАВА СОБРАНА, НО ТРЕБУЕТ ВНИМАНИЯ: {book_title} — {chap_name}", C_BOLD + C_YELLOW))
     print(c_text(f" ⏱️ Общее время выполнения: {total_time/60:.1f} мин.", C_WHITE))
     if master_mp3.exists():
         size_mb = master_mp3.stat().st_size / 1024 / 1024
@@ -445,9 +549,31 @@ def run_pipeline_for_chapter(
     if video and output_mp4.exists():
         size_mb = output_mp4.stat().st_size / 1024 / 1024
         print(c_text(f" 🎬 Видео MP4:  {output_mp4} ({size_mb:.1f} MB)", C_WHITE))
-    print(c_text(f" 🛡️ Качество:   100% подтверждено GPU Whisper (0 ошибок)", C_GREEN + C_BOLD))
+    if clean:
+        print(c_text(" 🛡️ Проверка:   окончания последних слов блоков подтверждены (0 дефектов)", C_GREEN + C_BOLD))
+    else:
+        print(c_text(f" 🛡️ Проверка:   НЕ пройдена полностью (дефектов: {issues_count}"
+                     f"{', ремонт завершился с ошибкой' if repair_incomplete else ''})", C_YELLOW + C_BOLD))
     print("=" * 76 + "\n")
-    return True
+    return RESULT_OK if clean else RESULT_ISSUES
+
+
+def _print_batch_summary(results):
+    """results: list of (chapter_info, RESULT_*). Prints an honest summary, returns the exit code."""
+    ok = [c for c, r in results if r == RESULT_OK]
+    issues = [c for c, r in results if r == RESULT_ISSUES]
+    failed = [c for c, r in results if r == RESULT_FAILED]
+    print("\n" + "=" * 76)
+    print(c_text(f" ИТОГ ПАКЕТНОГО ЗАПУСКА: всего {len(results)} | готово {len(ok)} | "
+                 f"с дефектами {len(issues)} | с ошибкой {len(failed)}", C_BOLD))
+    for c in issues:
+        print(c_text(f"   ⚠️ требует внимания: {c['chap_name']} ({c['file_path'].name})", C_YELLOW))
+    for c in failed:
+        print(c_text(f"   ❌ ошибка этапа:    {c['chap_name']} ({c['file_path'].name})", C_RED))
+    if not issues and not failed:
+        print(c_text(" Все главы успешно обработаны и проверены.", C_GREEN + C_BOLD))
+    print("=" * 76)
+    return exit_code_for([r for _, r in results])
 
 
 def interactive_menu():
@@ -476,7 +602,7 @@ def interactive_menu():
             status = ch["status"]
             badge = status["badge"]
             badge_code = status["code"]
-            if badge_code in ("PENDING", "IN_PROGRESS", "HAS_ISSUES"):
+            if badge_code in BATCH_CODES:
                 pending_indices.append(idx)
 
             details = ""
@@ -545,15 +671,17 @@ def interactive_menu():
             ask_vid = input(c_text(" Рендерить видео (NVENC) для каждой главы? [y/N]: ", C_YELLOW)).strip().lower()
             do_video = ask_vid in ("y", "yes", "да")
 
+            batch_results = []
             for p_idx in pending_indices:
                 target = chapters[p_idx - 1]
-                run_pipeline_for_chapter(
+                batch_results.append((target, run_pipeline_for_chapter(
                     target["file_path"],
                     video=do_video,
                     no_telegram=False,
-                    clean_cache=False
-                )
-            print(c_text("\n🎉 Пакетная генерация всех глав завершена!", C_GREEN + C_BOLD))
+                    clean_cache=False,
+                    skip_generation=target["status"]["code"] == "GENERATED"
+                )))
+            _print_batch_summary(batch_results)
             input("\nНажмите Enter для возврата в меню...")
             continue
 
@@ -581,6 +709,24 @@ def interactive_menu():
             continue
 
         print(c_text(f"Неизвестная команда: {choice}", C_RED))
+
+
+def _verify_and_report(info: dict, device: str) -> int:
+    """Runs the verifier once and returns an honest process exit code (0 clean / 1 could not verify / 3 defects)."""
+    chap_dir = info["chap_dir"]
+    vres = run_verification(
+        [str(PYTHON_BIN), str(VERIFY_SCRIPT), "--chapter-dir", str(chap_dir), "--device", device],
+        chap_dir / "gpu_verification_report.json",
+    )
+    print(vres.output)
+    if not vres.ok:
+        print(c_text(f"❌ Верификация не выполнена: {vres.reason}", C_RED + C_BOLD))
+        return EXIT_BATCH_FAILED
+    if vres.issues_count > 0:
+        print(c_text(f"⚠️ Найдено дефектов: {vres.issues_count}", C_YELLOW + C_BOLD))
+        return EXIT_BATCH_NEEDS_REVIEW
+    print(c_text("✓ Дефектов окончаний не найдено.", C_GREEN + C_BOLD))
+    return EXIT_OK
 
 
 def main():
@@ -619,23 +765,28 @@ def main():
     # Batch run all
     if args.all:
         chapters = scan_all_chapters()
-        pending = [ch for ch in chapters if ch["status"]["code"] in ("PENDING", "IN_PROGRESS", "HAS_ISSUES")]
-        if not pending:
+        plan = plan_batch(chapters, clean_cache=args.clean_cache)
+        if not plan:
             print(c_text("Все главы уже полностью готовы!", C_GREEN + C_BOLD))
             return
-        print(c_text(f"Найдено {len(pending)} ожидающих глав. Запуск пакетного цикла...", C_CYAN + C_BOLD))
+        print(c_text(f"Найдено {len(plan)} ожидающих глав. Запуск пакетного цикла...", C_CYAN + C_BOLD))
+        for item in plan:
+            if item["warning"]:
+                print(c_text(f"  ⚠️ {item['warning']}", C_YELLOW))
         bg_vid = Path(args.bg_video) if args.bg_video else None
-        for ch in pending:
-            run_pipeline_for_chapter(
+        batch_results = []
+        for item in plan:
+            ch = item["chapter"]
+            batch_results.append((ch, run_pipeline_for_chapter(
                 ch["file_path"],
                 video=args.video,
                 no_telegram=args.no_telegram,
-                clean_cache=args.clean_cache,
+                clean_cache=item["clean_cache"],
                 device=args.device,
-                bg_video=bg_vid
-            )
-        print(c_text("\nВсе главы успешно обработаны!", C_GREEN + C_BOLD))
-        return
+                bg_video=bg_vid,
+                skip_generation=item["skip_generation"]
+            )))
+        sys.exit(_print_batch_summary(batch_results))
 
     # Specific chapter provided
     if args.chapter_path:
@@ -658,28 +809,22 @@ def main():
 
         if args.verify_only:
             print(c_text(f"🔍 Запуск GPU верификации для {info['chap_name']}...", C_CYAN))
-            subprocess.run([
-                str(PYTHON_BIN), str(VERIFY_SCRIPT),
-                "--chapter-dir", str(info["chap_dir"]),
-                "--device", args.device
-            ])
-            return
+            sys.exit(_verify_and_report(info, args.device))
 
         if args.repair_only:
             print(c_text(f"🛡️ Запуск самоисцеления для {info['chap_name']}...", C_MAGENTA))
-            subprocess.run([
+            r_proc = subprocess.run([
                 str(PYTHON_BIN), str(REPAIR_SCRIPT),
                 "--chapter-dir", str(info["chap_dir"])
             ])
-            subprocess.run([
-                str(PYTHON_BIN), str(VERIFY_SCRIPT),
-                "--chapter-dir", str(info["chap_dir"]),
-                "--device", args.device
-            ])
-            return
+            v_code = _verify_and_report(info, args.device)
+            if r_proc.returncode != 0:
+                print(c_text(f"⚠️ Самоисцеление завершилось с кодом {r_proc.returncode}.", C_YELLOW + C_BOLD))
+                v_code = max(v_code, EXIT_BATCH_NEEDS_REVIEW) if v_code != EXIT_BATCH_FAILED else v_code
+            sys.exit(v_code)
 
         bg_vid = Path(args.bg_video) if args.bg_video else None
-        run_pipeline_for_chapter(
+        result = run_pipeline_for_chapter(
             target_path,
             video=args.video,
             no_telegram=args.no_telegram,
@@ -687,7 +832,7 @@ def main():
             device=args.device,
             bg_video=bg_vid
         )
-        return
+        sys.exit(exit_code_for([result]))
 
     # No arguments provided -> launch interactive menu
     try:

@@ -22,7 +22,7 @@ import whisper
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("AutoRepair")
 
-ROOT_DIR = Path("/mnt/ai/AI-Dubbing")
+ROOT_DIR = Path(os.environ.get("AUDIOBOOK_ROOT_DIR", "/mnt/ai/AI-Dubbing"))
 COSY_DIR = ROOT_DIR / "CosyVoice"
 MATCHA_DIR = COSY_DIR / "third_party" / "Matcha-TTS"
 
@@ -31,6 +31,12 @@ for p in [str(ROOT_DIR), str(COSY_DIR), str(MATCHA_DIR)]:
         sys.path.insert(0, p)
 
 from cosyvoice.cli.cosyvoice import AutoModel
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # fanfic_pipeline lives next to scripts/
+from fanfic_pipeline.exit_codes import EXIT_REPAIR_INCOMPLETE
+from fanfic_pipeline.runtime_guards import ThreadExceptionGuard
+
+THREAD_GUARD = ThreadExceptionGuard()   # CosyVoice swallows exceptions of its LLM thread
 
 VOICE_FILE = ROOT_DIR / "voices" / "VID_20261101_122350_289.wav"
 REF_TXT_PATH = ROOT_DIR / "voices" / "VID_20261101_122350_289.reference.txt"
@@ -151,14 +157,22 @@ def synthesize_candidate(text: str, cosyvoice, prompt_text, whisper_model, seeds
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
 
-        outputs = list(cosyvoice.inference_zero_shot(
-            tts_text=text,
-            prompt_text=prompt_text,
-            prompt_wav=str(VOICE_FILE),
-            stream=False,
-            speed=1.0,
-            text_frontend=False
-        ))
+        try:
+            THREAD_GUARD.clear()
+            outputs = list(cosyvoice.inference_zero_shot(
+                tts_text=text,
+                prompt_text=prompt_text,
+                prompt_wav=str(VOICE_FILE),
+                stream=False,
+                speed=1.0,
+                text_frontend=False
+            ))
+            THREAD_GUARD.raise_if_failed()
+        except Exception as e:   # previously one failed seed aborted the whole repair run
+            logger.warning(f"    Seed {seed:5d} -> inference failed: {type(e).__name__}: {e}")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            continue
         if not outputs or outputs[0]['tts_speech'].shape[1] == 0:
             continue
 
@@ -317,6 +331,7 @@ def main():
     logger.info(f"Found {len(issues)} issue(s) requiring self-healing repair...")
 
     model_dir = str(COSY_DIR / "pretrained_models" / "Fun-CosyVoice3-0.5B")
+    THREAD_GUARD.install()
     logger.info("Loading CosyVoice 3 model...")
     cosyvoice = AutoModel(model_dir=model_dir)
 
@@ -339,8 +354,9 @@ def main():
     if repaired_count > 0:
         reassemble_master(chap_dir, cosyvoice.sample_rate)
         logger.info(f"=== Successfully repaired {repaired_count}/{len(issues)} segments! ===")
-    return repaired_count
+    # Exit status (was: always 0, even when nothing could be repaired):
+    return 0 if repaired_count == len(issues) else EXIT_REPAIR_INCOMPLETE
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
