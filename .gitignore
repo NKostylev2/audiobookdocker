@@ -31,7 +31,11 @@ system/
 *.dll
 
 # Large output directories and media
-output/
+output/*
+!output/Potter/
+output/Potter/*
+!output/Potter/chapters_ru/
+!output/Potter/chapters_ru/*.txt
 work/
 failed/
 logs/
