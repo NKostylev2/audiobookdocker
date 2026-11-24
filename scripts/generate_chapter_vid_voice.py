@@ -88,8 +88,11 @@ from fanfic_pipeline.segmenter import SentenceSegmenter
 from fanfic_pipeline.exit_codes import (
     EXIT_TEXT_MISSING, EXIT_VOICE_MISSING, EXIT_NO_AUDIO, EXIT_SEGMENTS_FAILED,
 )
-from fanfic_pipeline.runtime_guards import ThreadExceptionGuard
+from fanfic_pipeline.runtime_guards import ThreadExceptionGuard, configure_cuda_optimizations
 from fanfic_pipeline.split_ops import split_for_fallback
+
+# Configure Ampere TF32 & cuDNN optimizations
+configure_cuda_optimizations()
 
 # CosyVoice decodes in a worker thread and swallows its exceptions (see runtime_guards.py)
 THREAD_GUARD = ThreadExceptionGuard()
@@ -571,6 +574,7 @@ def _worker_process_entry(
             result_queue.put({"type": "log", "worker_id": worker_id, "level": "error", "msg": str(msg)})
 
     w_logger = QueueLogger()
+    configure_cuda_optimizations()
     thread_guard = ThreadExceptionGuard()
     thread_guard.install()
 

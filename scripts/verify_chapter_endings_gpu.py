@@ -52,6 +52,10 @@ def main():
     import torch
     import whisper
 
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from fanfic_pipeline.runtime_guards import configure_cuda_optimizations
+    configure_cuda_optimizations()
+
     if args.device == "cuda" and not torch.cuda.is_available():
         logger.warning("CUDA not available! Falling back to CPU.")
         device = "cpu"

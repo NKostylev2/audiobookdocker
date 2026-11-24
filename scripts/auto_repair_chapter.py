@@ -34,7 +34,9 @@ from cosyvoice.cli.cosyvoice import AutoModel
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # fanfic_pipeline lives next to scripts/
 from fanfic_pipeline.exit_codes import EXIT_REPAIR_INCOMPLETE
-from fanfic_pipeline.runtime_guards import ThreadExceptionGuard
+from fanfic_pipeline.runtime_guards import ThreadExceptionGuard, configure_cuda_optimizations
+
+configure_cuda_optimizations()
 
 THREAD_GUARD = ThreadExceptionGuard()   # CosyVoice swallows exceptions of its LLM thread
 

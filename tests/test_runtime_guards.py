@@ -75,3 +75,10 @@ def test_system_exit_in_thread_is_not_an_error(silent_hook):
     with ThreadExceptionGuard() as guard:
         _run_failing_thread(exc=SystemExit(0))
         guard.raise_if_failed()
+
+
+def test_configure_cuda_optimizations_runs_safely():
+    from fanfic_pipeline.runtime_guards import configure_cuda_optimizations
+    # Must not raise whether CUDA is present or not
+    configure_cuda_optimizations()
+

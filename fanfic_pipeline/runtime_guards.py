@@ -65,3 +65,22 @@ class ThreadExceptionGuard:
             name, exc = errors[0]
             more = f" (+{len(errors) - 1} more)" if len(errors) > 1 else ""
             raise ThreadFailure(f"thread '{name}' died: {type(exc).__name__}: {exc}{more}") from exc
+
+
+def configure_cuda_optimizations():
+    """
+    Configures NVIDIA Ampere (RTX 30-series / 40-series) TF32 and cuDNN benchmark
+    optimizations for high-throughput speech synthesis and vocoder convolutions.
+    """
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.set_float32_matmul_precision("high")
+            if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+                torch.backends.cuda.matmul.allow_tf32 = True
+            if hasattr(torch.backends, "cudnn"):
+                torch.backends.cudnn.allow_tf32 = True
+                torch.backends.cudnn.benchmark = True
+    except Exception:
+        pass
+
