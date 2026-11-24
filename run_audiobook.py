@@ -413,7 +413,8 @@ def run_pipeline_for_chapter(
     clean_cache: bool = False,
     device: str = "cuda",
     bg_video: Path = None,
-    skip_generation: bool = False
+    skip_generation: bool = False,
+    workers: int = None
 ):
     """
     Executes the autonomous end-to-end pipeline for a single chapter:
@@ -463,6 +464,8 @@ def run_pipeline_for_chapter(
             gen_cmd.append("--no-telegram")
         if clean_cache:
             gen_cmd.append("--clean-cache")
+        if workers is not None:
+            gen_cmd.extend(["--workers", str(workers)])
 
         tail = deque(maxlen=30)   # last lines of worker output, shown if the worker fails
         p = subprocess.Popen(gen_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
@@ -790,6 +793,7 @@ def main():
     parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"], help="Устройство для верификации (по умолчанию: cuda)")
     parser.add_argument("--verify-only", action="store_true", help="Только запустить верификацию на GPU")
     parser.add_argument("--repair-only", action="store_true", help="Только запустить самоисцеление дефектов")
+    parser.add_argument("--workers", type=int, default=None, help="Число параллельных воркеров генерации (по умолчанию авто: 3 для 24GB, 1 для 8GB)")
 
     args = parser.parse_args()
 
@@ -831,7 +835,8 @@ def main():
                 clean_cache=item["clean_cache"],
                 device=args.device,
                 bg_video=bg_vid,
-                skip_generation=item["skip_generation"]
+                skip_generation=item["skip_generation"],
+                workers=args.workers
             )))
         sys.exit(_print_batch_summary(batch_results))
 
@@ -882,7 +887,8 @@ def main():
             no_telegram=args.no_telegram,
             clean_cache=args.clean_cache,
             device=args.device,
-            bg_video=bg_vid
+            bg_video=bg_vid,
+            workers=args.workers
         )
         sys.exit(exit_code_for([result]))
 

@@ -413,6 +413,229 @@ def sanitize_segment_audio(wav: torch.Tensor, sr: int = 24000) -> torch.Tensor:
 
     return wav
 
+def get_default_workers() -> int:
+    env_w = os.environ.get("AUDIOBOOK_WORKERS")
+    if env_w and env_w.isdigit():
+        return max(1, int(env_w))
+    if not torch.cuda.is_available():
+        return 1
+    try:
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        if vram_gb >= 22.0:
+            return 3  # RTX 3090, RTX 4090 (24GB) -> 3 parallel workers (~19.5GB VRAM)
+        elif vram_gb >= 14.0:
+            return 2  # 16GB cards -> 2 parallel workers (~13GB VRAM)
+        else:
+            return 1  # 8GB cards (RTX 3070) -> 1 worker (safe from OOM)
+    except Exception:
+        return 1
+
+def synthesize_segment_core(
+    s_idx: int,
+    text: str,
+    seg_wav_path: Path,
+    cosyvoice,
+    whisper_model,
+    prompt_text: str,
+    voice_file: str,
+    base_seed: int,
+    thread_guard: ThreadExceptionGuard,
+    logger,
+    silence_sentence: torch.Tensor,
+) -> tuple:
+    """
+    Synthesizes a single segment with seed retries (up to 3) and Whisper ending verification.
+    If endings are still swallowed, splits into halves and joins them.
+    Saves the sanitized audio chunk to seg_wav_path.
+    Returns (success: bool, duration: float, message: str).
+    """
+    sample_rate = getattr(cosyvoice, "sample_rate", 24000)
+    best_chunk = None
+    ending_ok = False
+
+    # Attempt synthesis with up to 3 seed retries if ending is swallowed
+    for attempt, seed_offset in enumerate([0, 17, 42]):
+        cur_seed = base_seed + seed_offset
+        torch.manual_seed(cur_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(cur_seed)
+
+        try:
+            thread_guard.clear()
+            outputs = list(cosyvoice.inference_zero_shot(
+                tts_text=text,
+                prompt_text=prompt_text,
+                prompt_wav=voice_file,
+                stream=False,
+                speed=1.0,
+                text_frontend=False
+            ))
+            thread_guard.raise_if_failed()
+        except Exception as e:
+            logger.warning(f"[{s_idx+1}] Inference failed on attempt {attempt+1} (seed {cur_seed}): {e}")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            continue
+
+        if outputs and outputs[0]['tts_speech'].shape[1] > 0:
+            wav_candidate = torch.concat([o['tts_speech'] for o in outputs], dim=1)
+            if whisper_model:
+                ending_ok = verify_segment_audio_ending(wav_candidate, sample_rate, text, whisper_model)
+                if ending_ok:
+                    best_chunk = wav_candidate
+                    break
+                else:
+                    best_chunk = wav_candidate
+                    logger.info(f"[{s_idx+1}] Swallowed ending detected, retry attempt {attempt+1} with seed {cur_seed+17}...")
+            else:
+                ending_ok = True
+                best_chunk = wav_candidate
+                break
+
+    # Fallback: if all retries still swallowed the ending, split segment into halves
+    if best_chunk is not None and whisper_model and not ending_ok:
+        logger.warning(f"[{s_idx+1}] Retries exhausted. Splitting segment into halves to guarantee endings...")
+        halves = split_for_fallback(text)
+        if halves is None:
+            logger.warning(f"[{s_idx+1}] No safe split point; keeping the best candidate unchanged.")
+            halves = []
+        half_chunks = []
+        for h_i, half_text in enumerate(halves):
+            for h_attempt, h_seed_offset in enumerate([0, 19, 47]):
+                h_seed = base_seed + h_i * 100 + h_seed_offset
+                torch.manual_seed(h_seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(h_seed)
+                try:
+                    thread_guard.clear()
+                    h_outputs = list(cosyvoice.inference_zero_shot(
+                        tts_text=half_text,
+                        prompt_text=prompt_text,
+                        prompt_wav=voice_file,
+                        stream=False,
+                        speed=1.0,
+                        text_frontend=False
+                    ))
+                    thread_guard.raise_if_failed()
+                except Exception as e:
+                    logger.warning(f"[{s_idx+1}] Half inference failed (half {h_i}, attempt {h_attempt+1}): {e}")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    continue
+
+                if h_outputs and h_outputs[0]['tts_speech'].shape[1] > 0:
+                    h_cand = torch.concat([o['tts_speech'] for o in h_outputs], dim=1)
+                    if verify_segment_audio_ending(h_cand, sample_rate, half_text, whisper_model):
+                        half_chunks.append(h_cand)
+                        break
+                    elif h_attempt == 2:
+                        half_chunks.append(h_cand)
+
+        if halves and len(half_chunks) == len(halves):
+            joined = []
+            for i, c in enumerate(half_chunks):
+                joined.append(c)
+                if i < len(half_chunks) - 1:
+                    joined.append(silence_sentence)
+            best_chunk = torch.cat(joined, dim=1)
+            logger.info(f"[{s_idx+1}] Fallback split successful! Repaired segment: {text[:45]}...")
+
+    if best_chunk is not None:
+        wav_chunk = sanitize_segment_audio(best_chunk, sample_rate)
+        torchaudio.save(str(seg_wav_path), wav_chunk, sample_rate)
+        seg_dur = wav_chunk.shape[1] / sample_rate
+        return (True, seg_dur, "OK")
+    else:
+        logger.error(f"[{s_idx+1}] Segment could not be synthesized after all attempts: {text}")
+        return (False, 0.0, "Failed")
+
+def _worker_process_entry(
+    worker_id: int,
+    model_dir: str,
+    voice_file: str,
+    prompt_text: str,
+    whisper_dev: str,
+    whisper_verify: bool,
+    task_queue,
+    result_queue,
+):
+    """
+    Subprocess worker for parallel CosyVoice 3 + Whisper synthesis.
+    """
+    class QueueLogger:
+        def info(self, msg):
+            result_queue.put({"type": "log", "worker_id": worker_id, "level": "info", "msg": str(msg)})
+        def warning(self, msg):
+            result_queue.put({"type": "log", "worker_id": worker_id, "level": "warning", "msg": str(msg)})
+        def error(self, msg):
+            result_queue.put({"type": "log", "worker_id": worker_id, "level": "error", "msg": str(msg)})
+
+    w_logger = QueueLogger()
+    thread_guard = ThreadExceptionGuard()
+    thread_guard.install()
+
+    try:
+        w_logger.info(f"Worker {worker_id + 1} loading CosyVoice 3 model...")
+        cosyvoice = AutoModel(model_dir=model_dir)
+        sr = getattr(cosyvoice, "sample_rate", 24000)
+        silence_sentence = torch.zeros((1, int(sr * 0.20)))
+
+        whisper_model = None
+        if whisper_verify:
+            import whisper
+            w_logger.info(f"Worker {worker_id + 1} loading Whisper base on {whisper_dev.upper()}...")
+            whisper_model = whisper.load_model("base", device=whisper_dev)
+
+        result_queue.put({"type": "ready", "worker_id": worker_id})
+    except Exception as e:
+        w_logger.error(f"Worker {worker_id + 1} failed during initialization: {e}")
+        result_queue.put({"type": "error", "worker_id": worker_id, "error": str(e)})
+        return
+
+    while True:
+        try:
+            task = task_queue.get()
+        except Exception:
+            break
+        if task is None:
+            break
+
+        s_idx, text, base_seed, seg_wav_str = task
+        seg_wav_path = Path(seg_wav_str)
+        t0 = time.time()
+
+        try:
+            success, dur, msg = synthesize_segment_core(
+                s_idx=s_idx,
+                text=text,
+                seg_wav_path=seg_wav_path,
+                cosyvoice=cosyvoice,
+                whisper_model=whisper_model,
+                prompt_text=prompt_text,
+                voice_file=voice_file,
+                base_seed=base_seed,
+                thread_guard=thread_guard,
+                logger=w_logger,
+                silence_sentence=silence_sentence,
+            )
+        except Exception as e:
+            w_logger.error(f"Worker {worker_id + 1} unhandled exception on segment {s_idx+1}: {e}")
+            success, dur, msg = False, 0.0, str(e)
+
+        elapsed = time.time() - t0
+        result_queue.put({
+            "type": "result",
+            "worker_id": worker_id,
+            "s_idx": s_idx,
+            "success": success,
+            "dur": dur,
+            "elapsed": elapsed,
+            "text_preview": text[:45],
+            "msg": msg
+        })
+
+    result_queue.put({"type": "done", "worker_id": worker_id})
+
 def main():
     global OUT_DIR, CACHE_DIR, LOG_FILE, STATUS_FILE, FFMPEG_EXE, VOICE_FILE, VOICE_NAME
 
@@ -424,6 +647,7 @@ def main():
     parser.add_argument("--clean-cache", action="store_true")
     parser.add_argument("--no-telegram", action="store_true", help="Disable Telegram reporting and upload")
     parser.add_argument("--whisper-verify", action="store_true", default=True, help="Verify segment audio endings with Whisper")
+    parser.add_argument("--workers", type=int, default=None, help="Number of parallel workers (default: auto based on VRAM)")
     parser.add_argument("--export-windows", action="store_true", default=False, help="Export master to Windows Desktop/Downloads")
     args = parser.parse_args()
 
@@ -544,25 +768,49 @@ def main():
 
     # 1. Load CosyVoice Model first to get tokenizer
     model_dir = str(COSY_DIR / "pretrained_models" / "Fun-CosyVoice3-0.5B")
-    logger.info(f"Loading CosyVoice 3 model from {model_dir}...")
-    t0 = time.time()
-    cosyvoice = AutoModel(model_dir=model_dir)
-    logger.info(f"Model loaded in {time.time() - t0:.2f}s. Sample rate: {cosyvoice.sample_rate}")
+    num_workers = args.workers if args.workers is not None else get_default_workers()
+    logger.info(f"Parallel synthesis workers configured: {num_workers}")
 
-    # Load Whisper for automated ending verification if enabled
+    whisper_dev = os.environ.get("WHISPER_DEVICE")
+    if not whisper_dev:
+        if torch.cuda.is_available():
+            vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            whisper_dev = "cuda" if vram_gb >= 12.0 else "cpu"
+        else:
+            whisper_dev = "cpu"
+
+    sample_rate = 24000
+    cosyvoice = None
     whisper_model = None
-    if args.whisper_verify:
-        whisper_dev = os.environ.get("WHISPER_DEVICE")
-        if not whisper_dev:
-            if torch.cuda.is_available():
-                vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-                whisper_dev = "cuda" if vram_gb >= 12.0 else "cpu"
-            else:
-                whisper_dev = "cpu"
-        logger.info(f"Loading Whisper base on {whisper_dev.upper()} for automated ending verification (VRAM adaptive)...")
-        import whisper
-        whisper_model = whisper.load_model("base", device=whisper_dev)
-        logger.info(f"Whisper model ready on {whisper_dev.upper()}.")
+
+    if num_workers == 1:
+        logger.info(f"Loading CosyVoice 3 model from {model_dir}...")
+        t0 = time.time()
+        cosyvoice = AutoModel(model_dir=model_dir)
+        sample_rate = getattr(cosyvoice, "sample_rate", 24000)
+        logger.info(f"Model loaded in {time.time() - t0:.2f}s. Sample rate: {sample_rate}")
+
+        if args.whisper_verify:
+            logger.info(f"Loading Whisper base on {whisper_dev.upper()} for automated ending verification...")
+            import whisper
+            whisper_model = whisper.load_model("base", device=whisper_dev)
+            logger.info(f"Whisper model ready on {whisper_dev.upper()}.")
+        tokenizer = cosyvoice.frontend.tokenizer
+    else:
+        qwen_path = os.path.join(model_dir, 'CosyVoice-BlankEN')
+        if os.path.isdir(qwen_path):
+            try:
+                from cosyvoice.tokenizer.tokenizer import get_qwen_tokenizer
+                tokenizer = get_qwen_tokenizer(qwen_path, skip_special_tokens=True, version='cosyvoice3')
+                logger.info("Loaded tokenizer on CPU (multi-worker mode).")
+            except Exception:
+                cosyvoice = AutoModel(model_dir=model_dir)
+                tokenizer = cosyvoice.frontend.tokenizer
+                sample_rate = getattr(cosyvoice, "sample_rate", 24000)
+        else:
+            cosyvoice = AutoModel(model_dir=model_dir)
+            tokenizer = cosyvoice.frontend.tokenizer
+            sample_rate = getattr(cosyvoice, "sample_rate", 24000)
 
     # Load reference transcript
     ref_txt_path = Path(VOICE_FILE).with_suffix(".reference.txt")
@@ -574,7 +822,7 @@ def main():
     # 2. Read & Segment Chapter with Token-Aware Segmenter (35-65 tokens per block)
     paragraphs = load_paragraphs(text_path)
     segmenter = SentenceSegmenter(
-        tokenizer=cosyvoice.frontend.tokenizer,
+        tokenizer=tokenizer,
         min_tokens=35,
         max_tokens=65,
         min_block_tokens=25
@@ -591,7 +839,7 @@ def main():
         start_msg = (
             f"🎙 <b>Генерация {chapter_title} запущена</b>\n"
             f"👤 Голос: <code>{VOICE_NAME}</code>\n"
-            f"⚙️ Режим: <code>zero-shot</code> (text_frontend=False)\n"
+            f"⚙️ Режим: <code>zero-shot</code> (воркеров: {num_workers})\n"
             f"📑 Всего блоков: <b>{total_segs}</b> (60–90 токенов/блок)\n"
             f"🛡️ Автопроверка и защита окончаний: <b>АКТИВНА</b>\n"
             f"🛡️ Хвостовая тишина: <b>+500 мс</b>"
@@ -608,130 +856,180 @@ def main():
     }
     update_status(status)
 
-    silence_sentence = torch.zeros((1, int(cosyvoice.sample_rate * 0.20))) # 200 ms
-    silence_para = torch.zeros((1, int(cosyvoice.sample_rate * 0.50)))     # 500 ms
-    silence_tail = torch.zeros((1, int(cosyvoice.sample_rate * 0.50)))     # 500 ms tail digital silence
+    silence_sentence = torch.zeros((1, int(sample_rate * 0.20))) # 200 ms
+    silence_para = torch.zeros((1, int(sample_rate * 0.50)))     # 500 ms
+    silence_tail = torch.zeros((1, int(sample_rate * 0.50)))     # 500 ms tail digital silence
 
-    audio_chunks = []
-    failed_segments = []   # indices that produced no audio after all attempts
-    t_start_synth = time.time()
-
+    # Check existing cached segments to find work queue
+    missing_indices = []
+    cached_count = 0
     for s_idx, seg in enumerate(segments):
         seg_wav_path = CACHE_DIR / f"seg_{s_idx:04d}.wav"
-        text = seg["text"].strip()
-        if not text:
+        if seg_wav_path.exists() and seg_wav_path.stat().st_size > 1000:
+            cached_count += 1
+        else:
+            missing_indices.append(s_idx)
+
+    logger.info(f"Segment cache status: {cached_count}/{total_segs} already cached, {len(missing_indices)} to synthesize.")
+
+    failed_segments = []
+    t_start_synth = time.time()
+
+    if missing_indices:
+        if num_workers == 1:
+            for s_idx in missing_indices:
+                seg = segments[s_idx]
+                seg_wav_path = CACHE_DIR / f"seg_{s_idx:04d}.wav"
+                text = seg["text"].strip()
+                if not text:
+                    continue
+                t_seg = time.time()
+                success, dur, msg = synthesize_segment_core(
+                    s_idx=s_idx,
+                    text=text,
+                    seg_wav_path=seg_wav_path,
+                    cosyvoice=cosyvoice,
+                    whisper_model=whisper_model,
+                    prompt_text=prompt_text,
+                    voice_file=VOICE_FILE,
+                    base_seed=2026 + s_idx,
+                    thread_guard=THREAD_GUARD,
+                    logger=logger,
+                    silence_sentence=silence_sentence,
+                )
+                if success:
+                    logger.info(f"[{s_idx+1}/{total_segs}] Synth OK ({dur:.2f}s in {time.time()-t_seg:.2f}s): {text[:45]}...")
+                else:
+                    failed_segments.append(s_idx)
+
+                if (s_idx + 1) % 5 == 0 and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                completed_now = cached_count + (missing_indices.index(s_idx) + 1)
+                elapsed = time.time() - t_start_synth
+                avg_per_seg = elapsed / (missing_indices.index(s_idx) + 1)
+                remaining = (len(missing_indices) - (missing_indices.index(s_idx) + 1)) * avg_per_seg
+                status["completed_segments"] = completed_now
+                status["progress_pct"] = round(completed_now / total_segs * 100, 1)
+                status["eta_seconds"] = round(remaining, 1)
+                status["eta_minutes"] = round(remaining / 60, 1)
+                if (completed_now % 5 == 0) or (completed_now == total_segs):
+                    update_status(status)
+        else:
+            logger.info(f"Launching {num_workers} parallel synthesis workers for {len(missing_indices)} segments...")
+            import torch.multiprocessing as mp
+            ctx = mp.get_context("spawn")
+            task_queue = ctx.Queue()
+            result_queue = ctx.Queue()
+
+            for s_idx in missing_indices:
+                task_queue.put((
+                    s_idx,
+                    segments[s_idx]["text"].strip(),
+                    2026 + s_idx,
+                    str(CACHE_DIR / f"seg_{s_idx:04d}.wav")
+                ))
+
+            for _ in range(num_workers):
+                task_queue.put(None)
+
+            workers = []
+            for w_i in range(num_workers):
+                p = ctx.Process(
+                    target=_worker_process_entry,
+                    args=(
+                        w_i,
+                        model_dir,
+                        VOICE_FILE,
+                        prompt_text,
+                        whisper_dev,
+                        args.whisper_verify,
+                        task_queue,
+                        result_queue,
+                    )
+                )
+                p.start()
+                workers.append(p)
+
+            done_workers = set()
+            completed_needed = 0
+
+            try:
+                while len(done_workers) < num_workers:
+                    try:
+                        item = result_queue.get(timeout=1.0)
+                    except Exception:
+                        for idx_p, p in enumerate(workers):
+                            if not p.is_alive() and idx_p not in done_workers:
+                                logger.error(f"Worker {idx_p+1} died unexpectedly with exit code {p.exitcode}")
+                                done_workers.add(idx_p)
+                        continue
+
+                    itype = item.get("type")
+                    if itype == "ready":
+                        logger.info(f"Worker {item['worker_id']+1}/{num_workers} ready.")
+                    elif itype == "done":
+                        done_workers.add(item["worker_id"])
+                    elif itype == "log":
+                        lvl = item.get("level", "info")
+                        w_pfx = f"[W{item['worker_id']+1}] "
+                        if lvl == "warning":
+                            logger.warning(w_pfx + item["msg"])
+                        elif lvl == "error":
+                            logger.error(w_pfx + item["msg"])
+                        else:
+                            logger.info(w_pfx + item["msg"])
+                    elif itype == "result":
+                        completed_needed += 1
+                        s_idx = item["s_idx"]
+                        total_done = cached_count + completed_needed
+                        if item["success"]:
+                            logger.info(
+                                f"[{total_done}/{total_segs}] [W{item['worker_id']+1}] "
+                                f"Synth OK ({item['dur']:.2f}s in {item['elapsed']:.2f}s): {item['text_preview']}..."
+                            )
+                        else:
+                            logger.error(
+                                f"[{total_done}/{total_segs}] [W{item['worker_id']+1}] "
+                                f"Segment failed: {item['text_preview']}..."
+                            )
+                            failed_segments.append(s_idx)
+
+                        elapsed = time.time() - t_start_synth
+                        avg_per_seg = elapsed / max(1, completed_needed)
+                        remaining = (len(missing_indices) - completed_needed) * avg_per_seg
+                        status["completed_segments"] = total_done
+                        status["progress_pct"] = round(total_done / total_segs * 100, 1)
+                        status["eta_seconds"] = round(remaining, 1)
+                        status["eta_minutes"] = round(remaining / 60, 1)
+                        if total_done % 5 == 0 or total_done == total_segs:
+                            update_status(status)
+
+            except KeyboardInterrupt:
+                logger.warning("Interrupted by user (Ctrl+C). Terminating workers gracefully...")
+                for p in workers:
+                    if p.is_alive():
+                        p.terminate()
+                        p.join(timeout=2)
+                sys.exit(130)
+
+            for p in workers:
+                p.join(timeout=5)
+
+    # 3. Assemble Master Audio from cached segments
+    audio_chunks = []
+    for s_idx, seg in enumerate(segments):
+        seg_wav_path = CACHE_DIR / f"seg_{s_idx:04d}.wav"
+        if not seg_wav_path.exists() or seg_wav_path.stat().st_size <= 1000:
+            if s_idx not in failed_segments:
+                failed_segments.append(s_idx)
             continue
 
-        # Check existing cached segment
-        if seg_wav_path.exists() and seg_wav_path.stat().st_size > 1000:
-            wav_chunk, sr = torchaudio.load(str(seg_wav_path))
-            if sr != cosyvoice.sample_rate:
-                resampler = torchaudio.transforms.Resample(sr, cosyvoice.sample_rate)
-                wav_chunk = resampler(wav_chunk)
-            wav_chunk = sanitize_segment_audio(wav_chunk, cosyvoice.sample_rate)
-        else:
-            base_seed = 2026 + s_idx
-            best_chunk = None
-
-            # Attempt synthesis with up to 3 seed retries if ending is swallowed
-            for attempt, seed_offset in enumerate([0, 17, 42]):
-                cur_seed = base_seed + seed_offset
-                torch.manual_seed(cur_seed)
-                if torch.cuda.is_available():
-                    torch.cuda.manual_seed_all(cur_seed)
-
-                t_seg = time.time()
-                try:
-                    THREAD_GUARD.clear()
-                    outputs = list(cosyvoice.inference_zero_shot(
-                        tts_text=text,
-                        prompt_text=prompt_text,
-                        prompt_wav=VOICE_FILE,
-                        stream=False,
-                        speed=1.0,
-                        text_frontend=False
-                    ))
-                    THREAD_GUARD.raise_if_failed()   # a dead LLM thread would otherwise yield truncated audio silently
-                except Exception as e:
-                    logger.warning(f"[{s_idx+1}/{total_segs}] Inference failed on attempt {attempt+1} (seed {cur_seed}): {e}")
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    continue
-
-                if outputs and outputs[0]['tts_speech'].shape[1] > 0:
-                    wav_candidate = torch.concat([o['tts_speech'] for o in outputs], dim=1)
-                    if whisper_model:
-                        ending_ok = verify_segment_audio_ending(wav_candidate, cosyvoice.sample_rate, text, whisper_model)
-                        if ending_ok:
-                            best_chunk = wav_candidate
-                            break
-                        else:
-                            best_chunk = wav_candidate
-                            logger.info(f"[{s_idx+1}/{total_segs}] Swallowed ending detected, retry attempt {attempt+1} with seed {cur_seed+17}...")
-                    else:
-                        ending_ok = True
-                        best_chunk = wav_candidate
-                        break
-
-            # Fallback: if all retries still swallowed the ending, split segment into halves
-            if best_chunk is not None and whisper_model and not ending_ok:
-                logger.warning(f"[{s_idx+1}/{total_segs}] Retries exhausted. Splitting segment into halves to guarantee endings...")
-                halves = split_for_fallback(text)
-                if halves is None:
-                    logger.warning(f"[{s_idx+1}/{total_segs}] No safe split point; keeping the best candidate unchanged.")
-                    halves = []
-                half_chunks = []
-                for h_i, half_text in enumerate(halves):
-                    for h_attempt, h_seed_offset in enumerate([0, 19, 47]):
-                        h_seed = base_seed + h_i * 100 + h_seed_offset
-                        torch.manual_seed(h_seed)
-                        if torch.cuda.is_available():
-                            torch.cuda.manual_seed_all(h_seed)
-                        try:
-                            THREAD_GUARD.clear()
-                            h_outputs = list(cosyvoice.inference_zero_shot(
-                                tts_text=half_text,
-                                prompt_text=prompt_text,
-                                prompt_wav=VOICE_FILE,
-                                stream=False,
-                                speed=1.0,
-                                text_frontend=False
-                            ))
-                            THREAD_GUARD.raise_if_failed()
-                        except Exception as e:
-                            logger.warning(f"[{s_idx+1}/{total_segs}] Half inference failed (half {h_i}, attempt {h_attempt+1}): {e}")
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                            continue
-
-                        if h_outputs and h_outputs[0]['tts_speech'].shape[1] > 0:
-                            h_cand = torch.concat([o['tts_speech'] for o in h_outputs], dim=1)
-                            if verify_segment_audio_ending(h_cand, cosyvoice.sample_rate, half_text, whisper_model):
-                                half_chunks.append(h_cand)
-                                break
-                            elif h_attempt == 2:
-                                half_chunks.append(h_cand)
-
-                if halves and len(half_chunks) == len(halves):
-                    joined = []
-                    for i, c in enumerate(half_chunks):
-                        joined.append(c)
-                        if i < len(half_chunks) - 1:
-                            joined.append(silence_sentence)
-                    best_chunk = torch.cat(joined, dim=1)
-                    logger.info(f"[{s_idx+1}/{total_segs}] Fallback split successful! Repaired segment: {text[:45]}...")
-
-            if best_chunk is not None:
-                wav_chunk = sanitize_segment_audio(best_chunk, cosyvoice.sample_rate)
-                torchaudio.save(str(seg_wav_path), wav_chunk, cosyvoice.sample_rate)
-                seg_dur = wav_chunk.shape[1] / cosyvoice.sample_rate
-                logger.info(f"[{s_idx+1}/{total_segs}] Synth OK ({seg_dur:.2f}s in {time.time()-t_seg:.2f}s): {text[:45]}...")
-            else:
-                logger.error(f"[{s_idx+1}/{total_segs}] Segment could not be synthesized after all attempts: {text}")
-                failed_segments.append(s_idx)
-                continue
-
-        wav_chunk = sanitize_segment_audio(wav_chunk, cosyvoice.sample_rate)
+        wav_chunk, sr = torchaudio.load(str(seg_wav_path))
+        if sr != sample_rate:
+            resampler = torchaudio.transforms.Resample(sr, sample_rate)
+            wav_chunk = resampler(wav_chunk)
+        wav_chunk = sanitize_segment_audio(wav_chunk, sample_rate)
 
         audio_chunks.append(wav_chunk)
         if seg.get("is_last_in_p", False):
@@ -739,33 +1037,7 @@ def main():
         else:
             audio_chunks.append(silence_sentence)
 
-        if (s_idx + 1) % 5 == 0 and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        status["completed_segments"] = s_idx + 1
-        elapsed = time.time() - t_start_synth
-        avg_per_seg = elapsed / (s_idx + 1)
-        remaining = (total_segs - (s_idx + 1)) * avg_per_seg
-        status["progress_pct"] = round((s_idx + 1) / total_segs * 100, 1)
-        status["eta_seconds"] = round(remaining, 1)
-        status["eta_minutes"] = round(remaining / 60, 1)
-        if (s_idx + 1) % 5 == 0 or (s_idx + 1) == total_segs:
-            update_status(status)
-
-        # Progress reporting
-        step_notify = max(25, total_segs // 10)
-        if (s_idx + 1) % step_notify == 0:
-            prog_text = (
-                f"⏳ {chapter_title}: синтезировано {s_idx + 1}/{total_segs} ({status['progress_pct']}%) | "
-                f"Прошло: {elapsed / 60:.1f} мин. | Осталось: ~{status['eta_minutes']} мин."
-            )
-            logger.info(prog_text)
-            if not args.no_telegram:
-                send_telegram_message(f"⏳ <b>{prog_text}</b>", token, chat_id, proxy)
-
     if failed_segments:
-        # A silently missing segment is a hole in the book. Do not assemble / upload a master with gaps;
-        # the cache is kept, so re-running resumes and retries only the missing segments.
         logger.error(f"{len(failed_segments)} segment(s) could not be synthesized: {failed_segments}. "
                      f"Master NOT assembled; re-run to resume from cache.")
         status["state"] = "failed"
@@ -780,7 +1052,6 @@ def main():
         update_status(status)
         sys.exit(EXIT_NO_AUDIO)
 
-    # 3. Assemble Master Audio with trailing digital silence
     logger.info("Concatenating all audio segments with 500ms safety tail silence...")
     audio_chunks.append(silence_tail)
     full_wav = torch.cat(audio_chunks, dim=1)
@@ -789,8 +1060,8 @@ def main():
     else:
         safe_out_stem = OUT_DIR.name
     master_wav = OUT_DIR / f"{safe_out_stem}.wav"
-    torchaudio.save(str(master_wav), full_wav, cosyvoice.sample_rate)
-    total_dur_s = full_wav.shape[1] / cosyvoice.sample_rate
+    torchaudio.save(str(master_wav), full_wav, sample_rate)
+    total_dur_s = full_wav.shape[1] / sample_rate
     logger.info(f"Full WAV generated: {master_wav} (Duration: {total_dur_s/60:.1f} min)")
 
     # 4. Encode to MP3
