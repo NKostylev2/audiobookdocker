@@ -2,9 +2,6 @@ version: "3.8"
 
 services:
   audiobook:
-    build:
-      context: .
-      dockerfile: Dockerfile
     image: nkostylev/ai-dubbing:latest
     container_name: ai-dubbing-audiobook
     restart: unless-stopped

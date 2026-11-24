@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
 
 LABEL maintainer="AI-Dubbing"
