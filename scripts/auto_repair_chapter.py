@@ -335,8 +335,15 @@ def main():
     logger.info("Loading CosyVoice 3 model...")
     cosyvoice = AutoModel(model_dir=model_dir)
 
-    logger.info("Loading Whisper on CPU (0 VRAM)...")
-    whisper_model = whisper.load_model("base", device="cpu")
+    whisper_dev = os.environ.get("WHISPER_DEVICE")
+    if not whisper_dev:
+        if torch.cuda.is_available():
+            vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            whisper_dev = "cuda" if vram_gb >= 12.0 else "cpu"
+        else:
+            whisper_dev = "cpu"
+    logger.info(f"Loading Whisper on {whisper_dev.upper()}...")
+    whisper_model = whisper.load_model("base", device=whisper_dev)
 
     ref_text = REF_TXT_PATH.read_text(encoding="utf-8").strip() if REF_TXT_PATH.exists() else ""
     prompt_text = f"You are a helpful assistant.<|endofprompt|>{ref_text}"

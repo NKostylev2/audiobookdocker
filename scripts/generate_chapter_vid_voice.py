@@ -79,6 +79,9 @@ import re
 import numpy as np
 import torch
 import torchaudio
+
+if torch.cuda.is_available():
+    torch.set_float32_matmul_precision("high")
 import razdel
 from cosyvoice.cli.cosyvoice import AutoModel
 from fanfic_pipeline.segmenter import SentenceSegmenter
@@ -546,13 +549,20 @@ def main():
     cosyvoice = AutoModel(model_dir=model_dir)
     logger.info(f"Model loaded in {time.time() - t0:.2f}s. Sample rate: {cosyvoice.sample_rate}")
 
-    # Load Whisper for automated ending verification if enabled (on CPU to protect GPU VRAM)
+    # Load Whisper for automated ending verification if enabled
     whisper_model = None
     if args.whisper_verify:
-        logger.info("Loading Whisper base on CPU for automated ending verification...")
+        whisper_dev = os.environ.get("WHISPER_DEVICE")
+        if not whisper_dev:
+            if torch.cuda.is_available():
+                vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                whisper_dev = "cuda" if vram_gb >= 12.0 else "cpu"
+            else:
+                whisper_dev = "cpu"
+        logger.info(f"Loading Whisper base on {whisper_dev.upper()} for automated ending verification (VRAM adaptive)...")
         import whisper
-        whisper_model = whisper.load_model("base", device="cpu")
-        logger.info("Whisper model ready on CPU.")
+        whisper_model = whisper.load_model("base", device=whisper_dev)
+        logger.info(f"Whisper model ready on {whisper_dev.upper()}.")
 
     # Load reference transcript
     ref_txt_path = Path(VOICE_FILE).with_suffix(".reference.txt")
