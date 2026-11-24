@@ -23,6 +23,9 @@ services:
       - ./output:/app/output
       - ./work:/app/work
       - ./voices:/app/voices:ro
+      - ./run_audiobook.py:/app/run_audiobook.py
+      - ./scripts:/app/scripts
+      - ./fanfic_pipeline:/app/fanfic_pipeline
       # Model caches (so models are downloaded once and preserved across container restarts)
       - cosyvoice_models:/app/CosyVoice/pretrained_models
       - whisper_cache:/root/.cache/whisper
